@@ -1,0 +1,346 @@
+PROJECT DOCUMENTATION - 4WD MECANUM ROBOT (ESP32 + RASPBERRY PI 5)
+
+1) PROJECT OVERVIEW
+
+This robot is a 4-wheel mecanum mobile base (X-configuration) using DC motors with
+encoders for each wheel, controlled by an ESP32 Dev Board (38-pin type), with a
+Raspberry Pi 5 (8GB) as the high-level computer.
+
+Main drive power supply (user-provided): 12V DC.
+
+The robot also includes a NEMA17 stepper motor that drives a power screw, with a
+horizontal limit switch module for homing.
+
+Control goals include:
+- Omni-directional motion and rotation
+- Closed-loop wheel speed control
+- Position and orientation control using PID in (x, y, theta)
+- IMU-based orientation awareness (MPU6050 / IMU6050)
+
+Robot frame convention (user-confirmed):
+- +X axis points forward.
+
+
+2) USER-PROVIDED MECHANICAL PARAMETERS
+
+- Wheel radius: 97 mm = 0.097 m
+- Left-right wheel spacing: 294 mm = 0.294 m
+- Front-back wheel spacing: 180 mm = 0.180 m
+
+For mecanum equations (common notation):
+- Half lateral distance W = 0.294 / 2 = 0.147 m
+- Half longitudinal distance L = 0.180 / 2 = 0.090 m
+- Kinematic term (L + W) = 0.237 m
+
+Note:
+The naming wheelbase/track-width often changes between sources. The values above are
+kept exactly as provided and converted for implementation use.
+
+
+3) COMPUTE ARCHITECTURE
+
+3.1 ESP32 (low-level real-time)
+- Reads all 4 quadrature encoders
+- Drives all 4 DC motors
+- Runs wheel-level PID loops
+- Executes mecanum inverse kinematics
+- Handles stepper low-level control if assigned
+- Enforces safety timeout and emergency stop behavior
+
+3.2 Raspberry Pi 5 (high-level)
+- High-level planning, user interface, and autonomy logic
+- Sends motion commands to ESP32 through UART
+- Logs telemetry and diagnostics
+
+3.3 Communication
+- ESP32 <-> Raspberry Pi: UART (as specified by user)
+
+
+4) SCREENSHOT TRANSCRIPTION - ESP32 BOARD (38-PIN DEV BOARD)
+
+The ESP32 screenshot shows a 38-pin style ESP-WROOM-32 development board pinout.
+
+4.1 Left header (pin number -> label)
+- 1 -> 3V3
+- 2 -> EN
+- 3 -> GPIO36 (VP / ADC)
+- 4 -> GPIO39 (VN / ADC)
+- 5 -> GPIO34 (ADC)
+- 6 -> GPIO35 (ADC)
+- 7 -> GPIO32 (ADC / TOUCH9)
+- 8 -> GPIO33 (ADC / TOUCH8)
+- 9 -> GPIO25 (ADC / DAC1)
+- 10 -> GPIO26 (ADC / DAC2)
+- 11 -> GPIO27 (ADC / TOUCH7)
+- 12 -> GPIO14 (ADC / TOUCH6)
+- 13 -> GPIO12 (ADC / TOUCH5)
+- 14 -> GPIO13 (ADC / TOUCH4)
+- 15 -> GND
+- 16 -> GPIO9 (FLASH D2)
+- 17 -> GPIO10 (FLASH D3)
+- 18 -> GPIO11 (FLASH CMD)
+- 19 -> VIN 5V
+
+4.2 Right header (pin number -> label)
+- 20 -> GPIO6 (FLASH CLK)
+- 21 -> GPIO7 (FLASH D0)
+- 22 -> GPIO8 (FLASH D1)
+- 23 -> GPIO15 (ADC / TOUCH3)
+- 24 -> GPIO2 (ADC / TOUCH2)
+- 25 -> GPIO0 (ADC / TOUCH1)
+- 26 -> GPIO4 (ADC / TOUCH0)
+- 27 -> GPIO16 (RX2)
+- 28 -> GPIO17 (TX2)
+- 29 -> GPIO5 (VSPI SS)
+- 30 -> GPIO18 (VSPI SCK)
+- 31 -> GPIO19 (VSPI MISO)
+- 32 -> GND
+- 33 -> GPIO21 (I2C SDA)
+- 34 -> GPIO3 (RX0)
+- 35 -> GPIO1 (TX0)
+- 36 -> GPIO22 (I2C SCL)
+- 37 -> GPIO23 (VSPI MOSI)
+- 38 -> GND
+
+Important board note:
+- GPIO34, GPIO35, GPIO36, GPIO39 are input-only (good for encoder channels).
+- GPIO6 to GPIO11 are tied to onboard flash on most boards and should not be used for
+  normal external control in final hardware designs.
+
+
+5) SCREENSHOT TRANSCRIPTION - DRIVE MOTOR DRIVER (ZK-5AD PAGE)
+
+Screenshot-visible details:
+- Product name: ZK-5AD 5A Dual DC Motor H-Bridge Drive Module
+- Input voltage shown: DC 3.0V to 14V
+- Interface labels shown on control side include: GND, 3.3V, and I/O lines
+- Two motor output terminals: Motor 1 and Motor 2
+- Text indicates 3.3V output pin availability on the module
+
+System-level implication:
+- One module controls two DC motors, so two modules are needed for four wheel motors
+  unless another equivalent 4-channel arrangement is used.
+
+
+5.1 SCREENSHOT TRANSCRIPTION - DC MOTOR MODEL (25GA370)
+
+Image title/details provided:
+- Motor model: 25GA370 DC Gear Motor with Encoder
+- Rated speed (listed): 60 RPM
+- Rated voltage: 12V DC
+- Power (listed): 3W
+- Stall torque (listed): 15 kg.cm
+- Output shaft diameter: 4 mm
+- Output shaft length: 25 mm
+- Motor body dimensions: 50 x 24 mm (without output shaft)
+- Material: Metal
+- Brand: Generic
+- SKU shown: 27109
+
+Important practical note:
+- The screenshot does not state encoder CPR/PPR or gearbox ratio explicitly.
+- These two values can be replaced in software by a direct measurement of counts per
+  wheel revolution, which is enough for wheel speed estimation and odometry scaling.
+
+
+6) SCREENSHOT TRANSCRIPTION - STEPPER DRIVER (DRV8825)
+
+DRV8825 control pins shown:
+- EN
+- M0
+- M1
+- M2
+- RST
+- SLP
+- STEP
+- DIR
+
+DRV8825 power/motor pins shown:
+- VMOT
+- GND
+- Motor A outputs
+- Motor B outputs
+
+User-provided stepper details:
+- Stepper model: NEMA17
+- Homing device: horizontal limit switch module
+- Microstepping setting: currently unknown
+
+Common DRV8825 microstepping reference (set by M0/M1/M2):
+- 000: Full step
+- 100: 1/2 step
+- 010: 1/4 step
+- 110: 1/8 step
+- 001: 1/16 step
+- 101: 1/32 step
+- 011: 1/32 step
+- 111: 1/32 step
+
+
+7) EXACT WHEEL CHANNEL / PIN MAPPING (FROM PROVIDED TABLE SCREENSHOT)
+
+7.1 DC motor control channels
+- MOTA -> Back Right wheel -> GPIO27, GPIO14
+- MOTB -> Front Right wheel -> GPIO13, GPIO19
+- MOTC -> Back Left wheel -> GPIO4, GPIO16
+- MOTD -> Front Left wheel -> GPIO17, GPIO18
+
+7.2 Encoder channels
+- ENC1 -> Back Left wheel -> GPIO39, GPIO36
+- ENC2 -> Front Left wheel -> GPIO34, GPIO35
+- ENC3 -> Front Right wheel -> GPIO33, GPIO32
+- ENC4 -> Back Right wheel -> GPIO25, GPIO26
+
+7.3 Current ESP32 wiring status (user-confirmed)
+- Currently connected: all four DC motor control channels (MOTA to MOTD)
+- Currently connected: all four encoder channels (ENC1 to ENC4)
+- Not yet connected: IMU6050, stepper driver control pins, limit switch wiring,
+  and full UART integration details
+
+Implementation note:
+- Encoder pin order is currently documented as listed, but final software must verify
+  per-wheel A/B order and sign using a direction test.
+
+7.4 Validated motor control logic (user-tested)
+- Test result: all 4 motors moved in the expected order.
+- Validated sequence per wheel: clockwise -> anticlockwise -> stop.
+- Confirmed control states on current hardware:
+  - Clockwise: IN1 = HIGH, IN2 = LOW
+  - Anticlockwise: IN1 = LOW, IN2 = HIGH
+  - Stop: IN1 = LOW, IN2 = LOW
+- Status: motor-driver logic is confirmed and ready for the next control stage.
+
+7.5 Encoder calibration results (user-tested, clockwise rotation)
+- Back Right (ENC4): -21694 counts over 5 turns -> 4338.8 counts/rev (magnitude)
+- Front Right (ENC3): -26108 counts over 6 turns -> 4351.3 counts/rev (magnitude)
+- Back Left (ENC1): -21751 counts over 5 turns -> 4350.2 counts/rev (magnitude)
+- Effective calibrated encoder resolution for wheel control (recommended):
+  4346.8 counts per wheel revolution (average magnitude)
+- Direction sign observation:
+  clockwise wheel rotation produced negative encoder counts on tested wheels.
+- Front Left (ENC2): not directly measured; currently assumed same hardware class and
+  same calibrated magnitude unless future testing shows deviation.
+
+
+8) IMU INTEGRATION
+
+Sensor:
+- IMU6050 (MPU6050 family)
+
+Recommended bus on ESP32:
+- I2C using GPIO21 (SDA) and GPIO22 (SCL), matching the pinout screenshot labels
+
+Use in control:
+- theta estimation and heading stabilization
+- yaw feedback into robot orientation PID
+
+
+9) CONTROL REQUIREMENTS
+
+User requirement:
+- PID control for robot position and orientation: (x, y, theta)
+
+Recommended control hierarchy:
+- Outer loop: pose PID on x, y, theta -> outputs body velocity commands (vx, vy, wz)
+- Inner loop: wheel speed PID for each motor -> tracks wheel targets from mecanum IK
+
+Kinematic mapping overview:
+- Input: desired (vx, vy, wz)
+- Output: target wheel angular velocities (w_fl, w_fr, w_bl, w_br)
+- Uses wheel radius and (L + W)
+
+
+10) SPEED TARGET POLICY
+
+User request indicates full-speed operation preference.
+
+Engineering policy for safe implementation:
+- Command saturation at maximum allowed motor duty
+- Apply acceleration/ramp limiting to avoid wheel slip and large current spikes
+- Keep PID outputs smooth while still allowing high peak speed
+
+Electrical context:
+- With a 12V supply and 12V-rated motors, full speed command should map to the
+  validated max duty that does not brownout ESP32 or overheat drivers.
+
+
+11) SOFTWARE DEVELOPMENT MODE
+
+User toolchain and constraints:
+- Upload and test with Arduino IDE
+- Final code architecture must be FreeRTOS-based
+- User wants to validate basic blocking version first, then migrate to FreeRTOS tasks
+
+Recommended staged workflow:
+1. Blocking bring-up tests (motors, encoders, IMU, stepper homing)
+2. Blocking integrated drive test (mecanum + closed-loop wheel speed)
+3. Migrate modules into FreeRTOS tasks with fixed update periods
+4. Add UART command parser and watchdog timeout
+5. Add pose PID (x, y, theta) and autonomous motion primitives
+
+
+12) HARDWARE DETAILS STILL UNKNOWN (TO BE MEASURED OR VERIFIED)
+
+- Native encoder CPR/PPR and gearbox ratio from datasheet: still unknown
+- Stepper microstepping DIP/jumper state: unknown
+- Desired stepper linear speed target: unknown
+- Maximum safe motor current and thermal limits for sustained full-speed running: unknown
+
+Gear ratio note:
+- Gear ratio is helpful but not strictly required if we directly measure encoder counts
+  per wheel revolution (effective calibration constant).
+
+These unknowns do not block bring-up tests. Effective encoder counts per wheel
+revolution has been measured and can be used directly in control and odometry scaling.
+
+
+13) HOW TO EXTRACT THE UNKNOWNS QUICKLY
+
+13.1 Encoder counts per wheel revolution
+- Mark one wheel with tape
+- Rotate exactly one wheel revolution by hand
+- Read encoder count delta
+- Repeat 5 times and average
+
+13.2 Effective gear ratio (practical method)
+- If encoder is on motor shaft, rotate wheel one full turn and measure motor-side counts
+- Compare to encoder CPR assumptions to estimate reduction
+
+13.3 DRV8825 microstepping
+- Record M0/M1/M2 wiring (HIGH/LOW)
+- Map wiring state using the table in Section 6
+
+
+14) FREE RTOS TARGET TASK SPLIT (FINAL ARCHITECTURE)
+
+- Task A (1 kHz): encoder sampling / pulse processing
+- Task B (200 Hz): wheel PID and actuator update
+- Task C (100 Hz): mecanum kinematics and command shaping
+- Task D (100 Hz): IMU read + orientation filter
+- Task E (50 Hz): pose control (x, y, theta)
+- Task F (50 Hz): UART RX/TX, heartbeat, telemetry
+- Task G (20 Hz): safety checks and diagnostics
+- Task H (on-demand): stepper homing and position moves
+
+
+15) ELECTRICAL AND SAFETY NOTES
+
+- Use common ground between ESP32, motor drivers, and sensors
+- Keep motor supply and logic wiring physically separated where possible
+- Add bulk capacitor near motor driver supply terminals
+- Configure command timeout so motors stop on lost UART link
+- Add a hardware emergency-stop path for motor power cutoff
+
+
+16) STATUS OF THIS DOCUMENT
+
+This file now includes:
+- The user-provided dimensions and architecture choices
+- The wheel channel and encoder pin mapping from the screenshot table
+- ESP32 pinout information from the ESP32 screenshot
+- Driver information visible in the DRV8825 and ZK-5AD screenshots
+- DC motor model specifications from the 25GA370 screenshot
+- Power supply value (12V DC)
+- Validated motor-driver logic test result for all four drive motors
+- Measured effective encoder calibration constant (counts per wheel revolution)
+- Control objectives including PID in x, y, theta with IMU-based orientation support
