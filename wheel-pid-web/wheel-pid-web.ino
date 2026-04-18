@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <math.h>
+#include <Wire.h>
 
 struct EncoderPins {
   uint8_t a;
@@ -31,6 +32,35 @@ struct PIDState {
   float out;
 };
 
+struct CascadePidState {
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float prevError;
+  float out;
+};
+
+enum ControlMode : uint8_t {
+  MODE_SINGLE_WHEEL_VELOCITY = 0,
+  MODE_POSITION_HEADING = 1,
+};
+
+struct MinPwmSweepState {
+  bool active;
+  int8_t direction;
+  uint8_t startPwm;
+  uint8_t endPwm;
+  uint8_t stepPwm;
+  uint16_t holdMs;
+  uint8_t currentPwm;
+  uint8_t detectedPwm;
+  uint8_t stableMoveTicks;
+  float detectRpmThreshold;
+  float avgAbsRpm;
+  uint32_t stepStartMs;
+};
+
 EncoderPins encoders[4] = {
     {39, 36, "ENC1 BackLeft"},
     {34, 35, "ENC2 FrontLeft"},
@@ -54,16 +84,33 @@ volatile int32_t encoderCount[4] = {0, 0, 0, 0};
 volatile uint8_t encoderPrevState[4] = {0, 0, 0, 0};
 
 int32_t lastEncoderCount[4] = {0, 0, 0, 0};
+float measuredRpmRaw[4] = {0, 0, 0, 0};
 float measuredRpm[4] = {0, 0, 0, 0};
 float targetRpm[4] = {0, 0, 0, 0};
 int16_t pwmCmd[4] = {0, 0, 0, 0};
+int8_t rpmSign[4] = {1, 1, -1, -1};
 
 PIDState pid[4] = {
-    {1.2f, 0.35f, 0.0f, 0.0f, 0.0f, 0.0f},
-    {1.2f, 0.35f, 0.0f, 0.0f, 0.0f, 0.0f},
-    {1.2f, 0.35f, 0.0f, 0.0f, 0.0f, 0.0f},
-    {1.2f, 0.35f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
 };
+
+  MinPwmSweepState minSweep = {
+    false,
+    1,
+    20,
+    90,
+    2,
+    700,
+    0,
+    0,
+    0,
+    2.5f,
+    0.0f,
+    0,
+  };
 
 WebServer server(80);
 
@@ -72,9 +119,10 @@ const char* AP_PASS = "pid12345";
 
 const float COUNTS_PER_WHEEL_REV = 4346.8f;  // From your calibration data
 const uint32_t CONTROL_INTERVAL_MS = 20;      // 50 Hz speed loop
-const uint16_t PWM_FREQ = 20000;
+const uint16_t PWM_FREQ = 1000;
 const uint8_t PWM_RES_BITS = 8;
 const int PWM_MAX = 255;
+const float TARGET_RPM_MAX = 60.0f;
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 void pwmAttachPinCompat(uint8_t pin, uint8_t channelHint) {
@@ -100,16 +148,458 @@ void pwmWriteCompat(uint8_t pin, uint8_t channel, uint32_t duty) {
 }
 #endif
 
-float pidTargetRpm = 20.0f;
+float pidTargetRpm = 50.0f;
 uint8_t activeWheel = 0;
 bool controllerEnabled = false;
-uint8_t minPwm = 35;
+uint8_t minPwm = 160;
+bool rawModeEnabled = false;
+int16_t rawPwmCmd = 0;
+ControlMode controlMode = MODE_SINGLE_WHEEL_VELOCITY;
+
+CascadePidState posPid = {0.08f, 0.0f, 0.002f, 0.0f, 0.0f, 0.0f};
+CascadePidState headingPid = {1.80f, 0.00f, 0.08f, 0.0f, 0.0f, 0.0f};
+
+float positionTargetCounts = 0.0f;
+float positionCurrentCounts = 0.0f;
+float positionErrorCounts = 0.0f;
+float positionTolCounts = 30.0f;
+float positionCmdRpm = 0.0f;
+float positionStepCm = 30.0f;
+float wheelDiameterCm = 6.5f;
+bool positionDone = false;
+uint8_t positionDoneTicks = 0;
+
+float headingTargetDeg = 0.0f;
+float headingErrorDeg = 0.0f;
+float headingCorrRpm = 0.0f;
+float headingCorrMaxRpm = 20.0f;
+int8_t headingCorrSign = -1;
+float headingDeadbandDeg = 1.5f;
+float headingEnableBaseRpm = 3.0f;
+bool autoLockHeadingOnStep = true;
+bool holdHeadingAtStop = true;
+float headingHoldMaxRpm = 12.0f;
+float headingHoldDeadbandDeg = 2.0f;
+CascadePidState headingHoldPid = {0.90f, 0.00f, 0.75f, 0.0f, 0.0f, 0.0f};
+float headingHoldMinRpm = 1.2f;
+float headingHoldEnterDeg = 5.0f;
+float headingHoldExitDeg = 1.0f;
+float headingHoldExitRateDps = 1.5f;
+float headingHoldKickErrDeg = 10.0f;
+float headingHoldKickGyroDps = 1.0f;
+float headingCorrSlewRpmPerSec = 80.0f;
+bool headingHoldActive = false;
+float headingHoldStableMs = 0.0f;
+float headingCorrCmdPrev = 0.0f;
+
+bool imuOk = false;
+float imuYawDeg = 0.0f;
+float imuGyroDps = 0.0f;
+float imuBiasDps = 0.0f;
+float imuAccXg = 0.0f;
+float imuAccYg = 0.0f;
+float imuAccXYg = 0.0f;
+float imuAccAlpha = 0.20f;
+float rpmFilterAlpha = 0.02f;
+
+bool slipEnabled = true;
+bool slipDetected = false;
+float slipCandidateMs = 0.0f;
+float slipWheelRpmThresh = 12.0f;
+float slipAccelThreshG = 0.03f;
+float slipDetectMs = 300.0f;
+float slipReleaseMs = 200.0f;
+float slipMaxRpm = 25.0f;
+float slipAvgWheelRpm = 0.0f;
+
+const uint8_t MPU6050_ADDR = 0x68;
+const float MPU6050_GYRO_Z_SCALE = 65.5f;  // LSB/(deg/s) at +-500 dps
+const float MPU6050_ACC_SCALE = 16384.0f;  // LSB/g at +-2g
+
+const uint8_t MIN_SWEEP_MIN_PWM = 0;
+const uint8_t MIN_SWEEP_MAX_PWM = 255;
 
 uint32_t lastControlMs = 0;
 uint32_t lastPrintMs = 0;
 
 bool isInputOnlyPin(uint8_t pin) {
   return pin == 34 || pin == 35 || pin == 36 || pin == 39;
+}
+
+float wrapAngleDeg(float angle) {
+  while (angle > 180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+  return angle;
+}
+
+float shortestAngleErrorDeg(float targetDeg, float currentDeg) {
+  float d = (targetDeg - currentDeg) * DEG_TO_RAD;
+  return atan2f(sinf(d), cosf(d)) * RAD_TO_DEG;
+}
+
+float countsToCm(float counts) {
+  float d = constrain(wheelDiameterCm, 1.0f, 30.0f);
+  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * d);
+  return counts / countsPerCm;
+}
+
+float cmToCounts(float cm) {
+  float d = constrain(wheelDiameterCm, 1.0f, 30.0f);
+  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * d);
+  return cm * countsPerCm;
+}
+
+void resetCascadePid(CascadePidState& s) {
+  s.integral = 0.0f;
+  s.prevError = 0.0f;
+  s.out = 0.0f;
+}
+
+void resetHighLevelControllers() {
+  resetCascadePid(posPid);
+  resetCascadePid(headingPid);
+  resetCascadePid(headingHoldPid);
+  positionCmdRpm = 0.0f;
+  headingCorrRpm = 0.0f;
+  positionDone = false;
+  positionDoneTicks = 0;
+  headingHoldActive = false;
+  headingHoldStableMs = 0.0f;
+  headingCorrCmdPrev = 0.0f;
+  slipCandidateMs = 0.0f;
+  slipDetected = false;
+}
+
+bool imuWriteReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool imuReadRegs(uint8_t startReg, uint8_t* buf, uint8_t len) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t read = Wire.requestFrom((int)MPU6050_ADDR, (int)len, (int)true);
+  if (read != len) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < len; i++) {
+    buf[i] = Wire.read();
+  }
+  return true;
+}
+
+bool imuReadGyroZRaw(int16_t& gzRaw) {
+  uint8_t data[2];
+  if (!imuReadRegs(0x47, data, 2)) {
+    return false;
+  }
+  gzRaw = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+  return true;
+}
+
+bool imuReadAccelXYRaw(int16_t& axRaw, int16_t& ayRaw) {
+  uint8_t data[4];
+  if (!imuReadRegs(0x3B, data, 4)) {
+    return false;
+  }
+  axRaw = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+  ayRaw = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
+  return true;
+}
+
+void imuZeroYaw() {
+  imuYawDeg = 0.0f;
+}
+
+bool imuCalibrateBias(uint16_t samples) {
+  if (!imuOk || samples < 20) {
+    return false;
+  }
+
+  float sum = 0.0f;
+  uint16_t okCount = 0;
+  for (uint16_t i = 0; i < samples; i++) {
+    int16_t gzRaw = 0;
+    if (imuReadGyroZRaw(gzRaw)) {
+      sum += ((float)gzRaw) / MPU6050_GYRO_Z_SCALE;
+      okCount++;
+    }
+    delay(2);
+  }
+
+  if (okCount < samples / 2) {
+    return false;
+  }
+
+  imuBiasDps = sum / (float)okCount;
+  return true;
+}
+
+bool imuInit() {
+  Wire.begin();
+  delay(10);
+
+  bool ok = true;
+  ok &= imuWriteReg(0x6B, 0x00);  // Wake up MPU6050
+  ok &= imuWriteReg(0x1B, 0x08);  // Gyro FS_SEL=1 => +-500 dps
+  ok &= imuWriteReg(0x1A, 0x03);  // DLPF for less noise
+  delay(50);
+
+  imuOk = ok;
+  if (imuOk) {
+    imuBiasDps = 0.0f;
+    imuGyroDps = 0.0f;
+    imuYawDeg = 0.0f;
+    imuCalibrateBias(400);
+  }
+  return imuOk;
+}
+
+void imuUpdate(float dt) {
+  if (!imuOk || dt <= 0.0001f) {
+    imuGyroDps = 0.0f;
+    imuAccXg = 0.0f;
+    imuAccYg = 0.0f;
+    imuAccXYg = 0.0f;
+    return;
+  }
+
+  int16_t axRaw = 0;
+  int16_t ayRaw = 0;
+  if (imuReadAccelXYRaw(axRaw, ayRaw)) {
+    float ax = ((float)axRaw) / MPU6050_ACC_SCALE;
+    float ay = ((float)ayRaw) / MPU6050_ACC_SCALE;
+    float a = constrain(imuAccAlpha, 0.02f, 1.0f);
+    imuAccXg += a * (ax - imuAccXg);
+    imuAccYg += a * (ay - imuAccYg);
+    imuAccXYg = sqrtf(imuAccXg * imuAccXg + imuAccYg * imuAccYg);
+  }
+
+  int16_t gzRaw = 0;
+  if (!imuReadGyroZRaw(gzRaw)) {
+    imuGyroDps = 0.0f;
+    return;
+  }
+
+  float gzDps = ((float)gzRaw) / MPU6050_GYRO_Z_SCALE;
+  imuGyroDps = gzDps - imuBiasDps;
+  imuYawDeg = wrapAngleDeg(imuYawDeg + imuGyroDps * dt);
+}
+
+void updateSlipDetector(float dt) {
+  bool yawHoldOnly = (controlMode == MODE_POSITION_HEADING) && (fabsf(positionCmdRpm) < headingEnableBaseRpm);
+
+  if (dt <= 0.0001f || !controllerEnabled || rawModeEnabled || minSweep.active || !slipEnabled || !imuOk) {
+    slipCandidateMs = 0.0f;
+    slipDetected = false;
+    slipAvgWheelRpm = 0.0f;
+    return;
+  }
+
+  if (yawHoldOnly) {
+    slipCandidateMs = 0.0f;
+    slipDetected = false;
+    slipAvgWheelRpm = 0.0f;
+    return;
+  }
+
+  float avgAbsTarget = 0.0f;
+  float avgAbsMeasured = 0.0f;
+  for (uint8_t i = 0; i < 4; i++) {
+    avgAbsTarget += fabsf(targetRpm[i]);
+    avgAbsMeasured += fabsf(measuredRpm[i]);
+  }
+  avgAbsTarget /= 4.0f;
+  avgAbsMeasured /= 4.0f;
+  slipAvgWheelRpm = avgAbsMeasured;
+
+  bool wheelsSpinning = avgAbsMeasured >= slipWheelRpmThresh;
+  bool commandMoving = avgAbsTarget >= slipWheelRpmThresh;
+  bool bodyNotMoving = imuAccXYg <= slipAccelThreshG;
+  bool candidate = wheelsSpinning && commandMoving && bodyNotMoving;
+
+  float dtMs = dt * 1000.0f;
+  float detectMs = constrain(slipDetectMs, 80.0f, 3000.0f);
+  float releaseMs = constrain(slipReleaseMs, 40.0f, 3000.0f);
+
+  if (candidate) {
+    slipCandidateMs += dtMs;
+    if (slipCandidateMs > detectMs * 2.0f) {
+      slipCandidateMs = detectMs * 2.0f;
+    }
+  } else {
+    slipCandidateMs -= dtMs * (detectMs / releaseMs);
+    if (slipCandidateMs < 0.0f) {
+      slipCandidateMs = 0.0f;
+    }
+  }
+
+  slipDetected = (slipCandidateMs >= detectMs);
+}
+
+float getAverageMotorEncoderCount() {
+  int64_t sum = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    // Keep position sign convention aligned with measured RPM convention.
+    int32_t raw = readEncoderCount(motors[i].encIndex);
+    int32_t signedCount = rpmSign[i] * (-raw);
+    sum += (int64_t)signedCount;
+  }
+  return (float)sum / 4.0f;
+}
+
+void updateHighLevelTargets(float dt) {
+  for (uint8_t i = 0; i < 4; i++) {
+    targetRpm[i] = 0.0f;
+  }
+
+  if (!controllerEnabled) {
+    return;
+  }
+
+  if (controlMode == MODE_SINGLE_WHEEL_VELOCITY) {
+    targetRpm[activeWheel] = constrain(pidTargetRpm, 0.0f, TARGET_RPM_MAX);
+    return;
+  }
+
+  positionCurrentCounts = getAverageMotorEncoderCount();
+  positionErrorCounts = positionTargetCounts - positionCurrentCounts;
+
+  if (fabsf(positionErrorCounts) <= positionTolCounts) {
+    if (positionDoneTicks < 255) positionDoneTicks++;
+  } else {
+    positionDoneTicks = 0;
+  }
+  positionDone = (positionDoneTicks >= 5);
+
+  posPid.integral += positionErrorCounts * dt;
+  posPid.integral = constrain(posPid.integral, -30000.0f, 30000.0f);
+  float posDeriv = (positionErrorCounts - posPid.prevError) / dt;
+  posPid.prevError = positionErrorCounts;
+
+  float base = posPid.kp * positionErrorCounts + posPid.ki * posPid.integral + posPid.kd * posDeriv;
+  if (positionDone) {
+    base = 0.0f;
+  }
+  base = constrain(base, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  posPid.out = base;
+  positionCmdRpm = base;
+
+  float corr = 0.0f;
+  headingErrorDeg = 0.0f;
+  if (imuOk) {
+    float rawHeadingError = shortestAngleErrorDeg(headingTargetDeg, imuYawDeg);
+    bool movingPhase = !positionDone && fabsf(positionCmdRpm) >= headingEnableBaseRpm;
+    bool holdPhase = positionDone && holdHeadingAtStop;
+    float corrTarget = 0.0f;
+
+    if (movingPhase) {
+      float errMove = rawHeadingError;
+      if (fabsf(errMove) <= headingDeadbandDeg) {
+        errMove = 0.0f;
+      }
+
+      // Damped move correction: P on heading error, D on measured yaw-rate.
+      float uMove = headingPid.kp * errMove - headingPid.kd * imuGyroDps;
+      if (fabsf(headingPid.ki) > 0.0001f && fabsf(errMove) < 12.0f) {
+        headingPid.integral += errMove * dt;
+        headingPid.integral = constrain(headingPid.integral, -40.0f, 40.0f);
+        uMove += headingPid.ki * headingPid.integral;
+      } else {
+        headingPid.integral = 0.0f;
+      }
+
+      uMove *= (float)headingCorrSign;
+      corrTarget = constrain(uMove, -headingCorrMaxRpm, headingCorrMaxRpm);
+
+      headingPid.prevError = errMove;
+      headingPid.out = corrTarget;
+      headingErrorDeg = errMove;
+
+      resetCascadePid(headingHoldPid);
+      headingHoldActive = false;
+      headingHoldStableMs = 0.0f;
+    } else if (holdPhase) {
+      bool errSettled = fabsf(rawHeadingError) <= headingHoldDeadbandDeg;
+      bool rateSettled = fabsf(imuGyroDps) <= headingHoldExitRateDps;
+
+      if (errSettled && rateSettled) {
+        corrTarget = 0.0f;
+        headingHoldStableMs += dt * 1000.0f;
+        headingHoldActive = false;
+        resetCascadePid(headingHoldPid);
+      } else {
+        headingHoldStableMs = 0.0f;
+        headingHoldActive = true;
+
+        float errHold = rawHeadingError;
+        if (errHold > headingHoldDeadbandDeg) errHold -= headingHoldDeadbandDeg;
+        else if (errHold < -headingHoldDeadbandDeg) errHold += headingHoldDeadbandDeg;
+        else errHold = 0.0f;
+
+        // Damped hold correction: mostly PD-like with optional very-limited I near target.
+        float uHold = headingHoldPid.kp * errHold - headingHoldPid.kd * imuGyroDps;
+        if (fabsf(headingHoldPid.ki) > 0.0001f && fabsf(errHold) < 8.0f) {
+          headingHoldPid.integral += errHold * dt;
+          headingHoldPid.integral = constrain(headingHoldPid.integral, -20.0f, 20.0f);
+          uHold += headingHoldPid.ki * headingHoldPid.integral;
+        } else {
+          headingHoldPid.integral = 0.0f;
+        }
+
+        uHold *= (float)headingCorrSign;
+        corrTarget = constrain(uHold, -headingHoldMaxRpm, headingHoldMaxRpm);
+
+        // Minimum correction acts as a direct stiction floor once outside hold deadband.
+        if (fabsf(errHold) > 0.0f && fabsf(corrTarget) < headingHoldMinRpm) {
+          if (corrTarget > 0.0f) {
+            corrTarget = headingHoldMinRpm;
+          } else if (corrTarget < 0.0f) {
+            corrTarget = -headingHoldMinRpm;
+          } else {
+            float signedErr = ((rawHeadingError >= 0.0f) ? 1.0f : -1.0f) * (float)headingCorrSign;
+            corrTarget = signedErr * headingHoldMinRpm;
+          }
+        }
+
+        headingHoldPid.prevError = errHold;
+        headingHoldPid.out = corrTarget;
+      }
+
+      headingErrorDeg = rawHeadingError;
+      resetCascadePid(headingPid);
+    } else {
+      // If heading hold is disabled at stop, freeze target to current yaw.
+      if (positionDone && !holdHeadingAtStop) {
+        headingTargetDeg = imuYawDeg;
+        headingErrorDeg = 0.0f;
+      }
+      resetCascadePid(headingPid);
+      resetCascadePid(headingHoldPid);
+      headingHoldActive = false;
+      headingHoldStableMs = 0.0f;
+      corrTarget = 0.0f;
+    }
+
+    // Slew limiting suppresses command sign flapping and helps eliminate yaw chatter.
+    float slew = max(0.0f, headingCorrSlewRpmPerSec) * dt;
+    corr = headingCorrCmdPrev + constrain(corrTarget - headingCorrCmdPrev, -slew, slew);
+    headingCorrCmdPrev = corr;
+  }
+  headingCorrRpm = corr;
+
+  // Right wheels: MOTA, MOTB. Left wheels: MOTC, MOTD.
+  targetRpm[0] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[1] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[2] = constrain(positionCmdRpm + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[3] = constrain(positionCmdRpm + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
 }
 
 void setupEncoderPin(uint8_t pin) {
@@ -170,6 +660,7 @@ void resetEncoders() {
 
   for (uint8_t i = 0; i < 4; i++) {
     lastEncoderCount[i] = 0;
+    measuredRpmRaw[i] = 0.0f;
     measuredRpm[i] = 0.0f;
   }
 }
@@ -187,6 +678,11 @@ void resetAllPidStates() {
 }
 
 void setMotorPwmSigned(uint8_t wheel, int cmd) {
+  // Explicit signed mapping:
+  // cmd in [-255, +255]
+  // +cmd => IN1 PWM, IN2 = 0
+  // -cmd => IN1 = 0, IN2 PWM
+  // 0 => both 0
   cmd = constrain(cmd, -PWM_MAX, PWM_MAX);
   pwmCmd[wheel] = cmd;
 
@@ -209,27 +705,162 @@ void stopAllMotors() {
   }
 }
 
+void stopRawMode() {
+  rawModeEnabled = false;
+  rawPwmCmd = 0;
+  stopAllMotors();
+}
+
+void startRawMode(int16_t cmd) {
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
+
+  controllerEnabled = false;
+  updateTargets();
+  resetAllPidStates();
+
+  rawModeEnabled = true;
+  rawPwmCmd = (int16_t)constrain((int)cmd, -PWM_MAX, PWM_MAX);
+
+  stopAllMotors();
+  setMotorPwmSigned(activeWheel, rawPwmCmd);
+}
+
+void setAllWheelsPwmSigned(int cmd) {
+  for (uint8_t i = 0; i < 4; i++) {
+    setMotorPwmSigned(i, cmd);
+  }
+}
+
+void updateMeasuredRpm(float dt) {
+  if (dt <= 0.0001f) {
+    return;
+  }
+
+  const float rpmScale = (60.0f / COUNTS_PER_WHEEL_REV) / dt;
+  float alpha = constrain(rpmFilterAlpha, 0.02f, 1.0f);
+  for (uint8_t i = 0; i < 4; i++) {
+    // Keep measuredRpm[] in motor order by reading each motor's mapped encoder.
+    const uint8_t encIdx = motors[i].encIndex;
+    int32_t countNow = readEncoderCount(encIdx);
+    int32_t delta = countNow - lastEncoderCount[encIdx];
+    lastEncoderCount[encIdx] = countNow;
+
+    // Per-wheel RPM sign lets you align measured RPM with your chosen target convention.
+    measuredRpmRaw[i] = ((float)rpmSign[i]) * (-((float)delta) * rpmScale);
+    measuredRpm[i] += alpha * (measuredRpmRaw[i] - measuredRpm[i]);
+  }
+}
+
+void stopMinPwmSweep() {
+  minSweep.active = false;
+  minSweep.stableMoveTicks = 0;
+  minSweep.avgAbsRpm = 0.0f;
+  stopAllMotors();
+}
+
+void startMinPwmSweep(int8_t direction, uint8_t startPwm, uint8_t endPwm, uint8_t stepPwm, uint16_t holdMs) {
+  direction = (direction >= 0) ? 1 : -1;
+
+  startPwm = constrain(startPwm, MIN_SWEEP_MIN_PWM, MIN_SWEEP_MAX_PWM);
+  endPwm = constrain(endPwm, MIN_SWEEP_MIN_PWM, MIN_SWEEP_MAX_PWM);
+  if (endPwm < startPwm) {
+    uint8_t t = startPwm;
+    startPwm = endPwm;
+    endPwm = t;
+  }
+
+  stepPwm = constrain(stepPwm, (uint8_t)1, (uint8_t)20);
+  holdMs = constrain((int)holdMs, 200, 3000);
+
+  controllerEnabled = false;
+  updateTargets();
+  resetAllPidStates();
+  resetEncoders();
+
+  minSweep.active = true;
+  minSweep.direction = direction;
+  minSweep.startPwm = startPwm;
+  minSweep.endPwm = endPwm;
+  minSweep.stepPwm = stepPwm;
+  minSweep.holdMs = holdMs;
+  minSweep.currentPwm = startPwm;
+  minSweep.detectedPwm = 0;
+  minSweep.stableMoveTicks = 0;
+  minSweep.avgAbsRpm = 0.0f;
+  minSweep.stepStartMs = millis();
+
+  int signedPwm = ((int)minSweep.currentPwm) * ((minSweep.direction > 0) ? 1 : -1);
+  setAllWheelsPwmSigned(signedPwm);
+}
+
+void updateMinPwmSweep(uint32_t now) {
+  if (!minSweep.active) {
+    return;
+  }
+
+  float sumAbs = 0.0f;
+  for (uint8_t i = 0; i < 4; i++) {
+    sumAbs += fabsf(measuredRpm[i]);
+  }
+  minSweep.avgAbsRpm = sumAbs / 4.0f;
+
+  if (minSweep.detectedPwm == 0) {
+    if (minSweep.avgAbsRpm >= minSweep.detectRpmThreshold) {
+      if (minSweep.stableMoveTicks < 255) {
+        minSweep.stableMoveTicks++;
+      }
+    } else {
+      minSweep.stableMoveTicks = 0;
+    }
+
+    if (minSweep.stableMoveTicks >= 3) {
+      minSweep.detectedPwm = minSweep.currentPwm;
+    }
+  }
+
+  if (now - minSweep.stepStartMs < minSweep.holdMs) {
+    return;
+  }
+
+  uint16_t nextPwm = (uint16_t)minSweep.currentPwm + (uint16_t)minSweep.stepPwm;
+  if (nextPwm > minSweep.endPwm) {
+    stopMinPwmSweep();
+    return;
+  }
+
+  minSweep.currentPwm = (uint8_t)nextPwm;
+  minSweep.stableMoveTicks = 0;
+  minSweep.stepStartMs = now;
+
+  int signedPwm = ((int)minSweep.currentPwm) * ((minSweep.direction > 0) ? 1 : -1);
+  setAllWheelsPwmSigned(signedPwm);
+}
+
 void updateTargets() {
   for (uint8_t i = 0; i < 4; i++) {
     targetRpm[i] = 0.0f;
   }
-  if (controllerEnabled) {
+  if (controllerEnabled && controlMode == MODE_SINGLE_WHEEL_VELOCITY) {
     targetRpm[activeWheel] = pidTargetRpm;
   }
 }
 
 void runControlLoop(float dt) {
-  const float rpmScale = (60.0f / COUNTS_PER_WHEEL_REV) / dt;
+  updateMeasuredRpm(dt);
+  imuUpdate(dt);
+  updateHighLevelTargets(dt);
+  updateSlipDetector(dt);
+
+  if (slipEnabled && slipDetected) {
+    float lim = constrain(slipMaxRpm, 0.0f, TARGET_RPM_MAX);
+    for (uint8_t i = 0; i < 4; i++) {
+      targetRpm[i] = constrain(targetRpm[i], -lim, lim);
+    }
+  }
 
   for (uint8_t i = 0; i < 4; i++) {
-    int32_t countNow = readEncoderCount(i);
-    int32_t delta = countNow - lastEncoderCount[i];
-    lastEncoderCount[i] = countNow;
-
-    // Your tests showed clockwise rotation gives negative counts.
-    // This sign flip makes clockwise-positive RPM easier to reason about.
-    measuredRpm[i] = -((float)delta) * rpmScale;
-
     float err = targetRpm[i] - measuredRpm[i];
 
     if (fabsf(targetRpm[i]) < 0.01f) {
@@ -250,8 +881,16 @@ void runControlLoop(float dt) {
     int cmd = (int)lroundf(u);
     cmd = constrain(cmd, -PWM_MAX, PWM_MAX);
 
-    if (abs(cmd) > 0 && abs(cmd) < minPwm) {
-      cmd = (cmd > 0) ? minPwm : -minPwm;
+    // Breakaway-only MinPWM: apply only when commanded to move but wheel is nearly stationary.
+    bool translationalMotion = !(controlMode == MODE_POSITION_HEADING && fabsf(positionCmdRpm) < headingEnableBaseRpm);
+    bool wantsMotion = fabsf(targetRpm[i]) > 0.8f;
+    bool wheelNearlyStopped = fabsf(measuredRpm[i]) < 1.0f;
+    if (translationalMotion && wantsMotion && wheelNearlyStopped && abs(cmd) < minPwm) {
+      int sign = 0;
+      if (cmd > 0) sign = 1;
+      else if (cmd < 0) sign = -1;
+      else sign = (err >= 0.0f) ? 1 : -1;
+      cmd = sign * (int)minPwm;
     }
 
     setMotorPwmSigned(i, cmd);
@@ -265,6 +904,9 @@ String pageHtml() {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <title>Wheel PID Tuner</title>
 <style>
 :root{--bg:#0b1220;--panel:#111827;--line:#293548;--txt:#e5e7eb;--muted:#9ca3af;--ok:#16a34a;--warn:#f59e0b;}
@@ -286,6 +928,11 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
 .table{width:100%;border-collapse:collapse}
 .table th,.table td{border-bottom:1px solid #2d3748;padding:8px;text-align:left;font-size:14px}
 .code{font-family:Consolas,monospace}
+.plotPanel{border:1px solid #334155;border-radius:10px;padding:8px;background:#0b1220;margin-top:8px}
+.plotCanvas{width:100%;height:220px;display:block;border:1px solid #334155;border-radius:8px;background:linear-gradient(180deg,#0c1730,#091123)}
+.legendRow{display:flex;gap:12px;flex-wrap:wrap;margin:6px 2px 10px 2px}
+.legendItem{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.legendSwatch{width:12px;height:3px;border-radius:2px;display:inline-block}
 </style>
 </head>
 <body>
@@ -293,11 +940,18 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
   <div class="card">
     <h2>Wheel Speed PID Tuner</h2>
     <div class="small">Connect to Wi-Fi <span class="code">ESP32-PID-TUNE</span> (pass <span class="code">pid12345</span>) and open <span class="code">192.168.4.1</span>.</div>
-    <div class="small">Tune one wheel at a time. Only selected wheel runs; others remain stopped.</div>
+    <div class="small">Mode 0: single-wheel velocity tuning. Mode 1: full position + IMU heading control.</div>
   </div>
 
   <div class="card">
     <div class="row">
+      <label>Mode</label>
+      <select id="mode">
+        <option value="0">0 - Single Wheel Velocity</option>
+        <option value="1">1 - Position + Heading</option>
+      </select>
+      <button class="main" onclick="setMode()">Set Mode</button>
+
       <label>Wheel</label>
       <select id="wheel">
         <option value="0">MOTA BackRight (ENC4)</option>
@@ -306,19 +960,119 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
         <option value="3">MOTD FrontLeft (ENC2)</option>
       </select>
 
-      <label>Target RPM</label><input id="target" type="number" value="20" step="1" />
-      <label>Kp</label><input id="kp" type="number" value="1.2" step="0.05" />
-      <label>Ki</label><input id="ki" type="number" value="0.35" step="0.05" />
+      <label>Target RPM</label><input id="target" type="number" value="50" step="1" min="0" max="60" />
+      <label>Kp</label><input id="kp" type="number" value="50" step="0.05" />
+      <label>Ki</label><input id="ki" type="number" value="6" step="0.05" />
       <label>Kd</label><input id="kd" type="number" value="0.00" step="0.01" />
-      <label>MinPWM</label><input id="minpwm" type="number" value="35" step="1" />
+      <label>MinPWM</label><input id="minpwm" type="number" value="160" step="1" max="255" />
+      <label>RPM LPF alpha</label><input id="alpha" type="number" value="0.02" step="0.01" min="0.02" max="1.00" />
 
-      <button class="main" onclick="applyConfig()">Apply</button>
+      <button class="main" onclick="applyConfig()">Apply Velocity Config</button>
       <button class="start" onclick="startCtrl()">Start</button>
       <button class="stop" onclick="stopCtrl()">Stop</button>
       <button onclick="resetI()">Reset I</button>
       <button onclick="resetEnc()">Reset Encoders</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <label>RPM Sign BR</label>
+      <select id="rs0" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <label>FR</label>
+      <select id="rs1" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <label>BL</label>
+      <select id="rs2" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <label>FL</label>
+      <select id="rs3" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <button class="main" onclick="applyRpmSign()">Apply RPM Sign</button>
+    </div>
     <div class="small" id="status">Status: -</div>
+  </div>
+
+  <div class="card">
+    <h2>Position + IMU Heading Control (4 Wheels)</h2>
+    <div class="row">
+      <label>Move Step (cm)</label><input id="pos_stepcm" type="number" value="30" step="1" onchange="applyMotionConfig()" />
+      <label>Wheel Diameter (cm)</label><input id="wheel_diam_cm" type="number" value="6.5" step="0.1" min="1" max="30" onchange="applyMotionConfig()" />
+      <label>Position Tol (counts)</label><input id="pos_tol" type="number" value="60" step="1" min="1" />
+      <label>Pos Kp</label><input id="pos_kp" type="number" value="0.08" step="0.005" />
+      <label>Pos Ki</label><input id="pos_ki" type="number" value="0.00" step="0.001" />
+      <label>Pos Kd</label><input id="pos_kd" type="number" value="0.002" step="0.001" />
+      <button class="start" onclick="startPosStep(1)">Move Forward Step</button>
+      <button class="start" onclick="startPosStep(-1)">Move Backward Step</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>Target Heading (deg)</label><input id="head_target" type="number" value="0" step="1" min="-180" max="180" onchange="applyMotionConfig()" />
+      <label>Head Kp</label><input id="head_kp" type="number" value="1.80" step="0.05" onchange="applyMotionConfig()" />
+      <label>Head Ki</label><input id="head_ki" type="number" value="0.00" step="0.01" onchange="applyMotionConfig()" />
+      <label>Head Kd</label><input id="head_kd" type="number" value="0.08" step="0.01" onchange="applyMotionConfig()" />
+      <label>Max Head Corr RPM</label><input id="head_max" type="number" value="20" step="1" min="0" max="60" onchange="applyMotionConfig()" />
+      <label>Hold At Stop</label>
+      <select id="head_hold" onchange="applyMotionConfig()"><option value="1">ON</option><option value="0">OFF</option></select>
+      <label>Hold Max Corr RPM</label><input id="head_hold_max" type="number" value="12" step="0.5" min="0" max="60" onchange="applyMotionConfig()" />
+      <label>Hold Min Corr RPM</label><input id="head_hold_min" type="number" value="1.2" step="0.1" min="0" max="60" onchange="applyMotionConfig()" />
+      <label>Move Deadband (deg)</label><input id="head_db" type="number" value="1.5" step="0.1" min="0" max="30" onchange="applyMotionConfig()" />
+      <label>Hold Deadband (deg)</label><input id="head_hold_db" type="number" value="2.0" step="0.1" min="0" max="30" onchange="applyMotionConfig()" />
+      <label>Hold Kp</label><input id="head_hold_kp" type="number" value="0.90" step="0.05" onchange="applyMotionConfig()" />
+      <label>Hold Ki</label><input id="head_hold_ki" type="number" value="0.00" step="0.01" onchange="applyMotionConfig()" />
+      <label>Hold Kd</label><input id="head_hold_kd" type="number" value="0.75" step="0.01" onchange="applyMotionConfig()" />
+      <label>Hold Rate DB (dps)</label><input id="head_hold_rate_db" type="number" value="1.5" step="0.1" min="0" max="40" onchange="applyMotionConfig()" />
+      <label>Corr Slew (rpm/s)</label><input id="head_slew" type="number" value="80" step="1" min="0" max="400" onchange="applyMotionConfig()" />
+      <label>Head Sign</label>
+      <select id="head_sign" onchange="applyMotionConfig()"><option value="-1">-1</option><option value="1">+1</option></select>
+      <button class="main" onclick="applyMotionConfig()">Apply Motion Config</button>
+      <button onclick="imuZero()">Zero Yaw</button>
+      <button onclick="imuCal()">Calibrate IMU Bias</button>
+    </div>
+    <div class="small">Move deadband works only while translating; hold deadband works only when position is done and yaw is being held in place.</div>
+    <div class="row" style="margin-top:8px">
+      <button class="start" onclick="startYawHold()">START YAW HOLD (IN PLACE)</button>
+      <button class="stop" onclick="stopCtrl()">STOP YAW HOLD</button>
+      <div class="small">Use this row for yaw-only bench tests: set target heading then press START.</div>
+    </div>
+    <div class="small" id="motionStatus">Motion: -</div>
+    <div class="small" id="imuStatus">IMU: -</div>
+  </div>
+
+  <div class="card">
+    <h2>Slip/Stall Observer (IMU X/Y + Wheel RPM)</h2>
+    <div class="row">
+      <label>Enable</label>
+      <select id="slip_en"><option value="1">ON</option><option value="0">OFF</option></select>
+      <label>Wheel RPM Thresh</label><input id="slip_rpm" type="number" value="12" step="1" min="1" max="60" />
+      <label>Accel Thresh g</label><input id="slip_accg" type="number" value="0.03" step="0.005" min="0.001" max="1.5" />
+      <label>Detect ms</label><input id="slip_detect" type="number" value="300" step="20" min="80" max="3000" />
+      <label>Release ms</label><input id="slip_release" type="number" value="200" step="20" min="40" max="3000" />
+      <label>Slip Max RPM</label><input id="slip_maxrpm" type="number" value="25" step="1" min="0" max="60" />
+      <label>IMU Acc LPF</label><input id="slip_accalpha" type="number" value="0.20" step="0.01" min="0.02" max="1.00" />
+      <button class="main" onclick="applySlipConfig()">Apply Slip Config</button>
+    </div>
+    <div class="small" id="slipStatus">Slip: -</div>
+  </div>
+
+  <div class="card">
+    <h2>Raw Single-Wheel Test (Bypass PID)</h2>
+    <div class="row">
+      <label>Raw PWM</label><input id="rawpwm" type="number" value="255" step="1" min="0" max="255" />
+      <button class="start" onclick="startRaw(1)">Run +Raw</button>
+      <button class="start" onclick="startRaw(-1)">Run -Raw</button>
+      <button class="stop" onclick="stopRaw()">Stop Raw</button>
+    </div>
+    <div class="small" id="rawStatus">Raw mode: -</div>
+    <div class="small">Signed mapping is strict: +Raw drives IN1, -Raw drives IN2, both with duty 0..255.</div>
+  </div>
+
+  <div class="card">
+    <h2>4-Wheel MinPWM Auto Sweep (Ground Test)</h2>
+    <div class="row">
+      <label>Start PWM</label><input id="ms_start" type="number" value="20" step="1" />
+      <label>End PWM</label><input id="ms_end" type="number" value="90" step="1" />
+      <label>Step</label><input id="ms_step" type="number" value="2" step="1" />
+      <label>Hold ms</label><input id="ms_hold" type="number" value="700" step="50" />
+      <button class="start" onclick="startSweep(1)">Start FWD Sweep</button>
+      <button class="start" onclick="startSweep(-1)">Start REV Sweep</button>
+      <button class="stop" onclick="stopSweep()">Stop Sweep</button>
+    </div>
+    <div class="small" id="sweepStatus">Sweep: -</div>
+    <div class="small">Detected PWM is the first sweep value where average absolute RPM stays above threshold for multiple control ticks.</div>
   </div>
 
   <div class="card">
@@ -342,11 +1096,188 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
       </tbody>
     </table>
   </div>
+
+  <div class="card">
+    <h2>Live Tuning Graphs</h2>
+    <div class="small">Graphs track the active wheel selected in the control section and keep roughly the last 45-50 seconds.</div>
+
+    <div class="plotPanel">
+      <div class="small">Active Wheel RPM / Target / Error</div>
+      <div class="legendRow">
+        <span class="legendItem"><span class="legendSwatch" style="background:#38bdf8"></span>Target RPM</span>
+        <span class="legendItem"><span class="legendSwatch" style="background:#22c55e"></span>Measured RPM</span>
+        <span class="legendItem"><span class="legendSwatch" style="background:#ef4444"></span>Error</span>
+      </div>
+      <canvas id="plot_rpm" class="plotCanvas"></canvas>
+    </div>
+
+    <div class="plotPanel">
+      <div class="small">Active Wheel PWM Command</div>
+      <div class="legendRow">
+        <span class="legendItem"><span class="legendSwatch" style="background:#f97316"></span>PWM Cmd</span>
+        <span class="legendItem"><span class="legendSwatch" style="background:#a855f7"></span>Slip Marker</span>
+      </div>
+      <canvas id="plot_pwm" class="plotCanvas"></canvas>
+    </div>
+
+    <div class="plotPanel">
+      <div class="small">Heading Trace</div>
+      <div class="legendRow">
+        <span class="legendItem"><span class="legendSwatch" style="background:#10b981"></span>Yaw</span>
+        <span class="legendItem"><span class="legendSwatch" style="background:#f59e0b"></span>Heading Target</span>
+        <span class="legendItem"><span class="legendSwatch" style="background:#ef4444"></span>Heading Error</span>
+      </div>
+      <canvas id="plot_heading" class="plotCanvas"></canvas>
+    </div>
+  </div>
 </div>
 
 <script>
 function f(x,d=2){return Number(x).toFixed(d)}
 async function hit(url){const r=await fetch(url);if(!r.ok){alert('Request failed: '+url);return null;}return r.text();}
+function syncFieldValue(id,val){
+  const el=document.getElementById(id);
+  if(!el) return;
+  if(document.activeElement===el) return;
+  const next=String(val);
+  if(el.value!==next) el.value=next;
+}
+
+const GRAPH_POINTS = 240;
+let graphActiveWheel = -1;
+const graph = {
+  target: [],
+  measured: [],
+  err: [],
+  pwm: [],
+  slip: [],
+  yaw: [],
+  headingTarget: [],
+  headingErr: [],
+};
+
+function pushGraph(key, v) {
+  const arr = graph[key];
+  const n = Number(v);
+  arr.push(Number.isFinite(n) ? n : 0);
+  if (arr.length > GRAPH_POINTS) arr.shift();
+}
+
+function clearWheelGraph() {
+  graph.target.length = 0;
+  graph.measured.length = 0;
+  graph.err.length = 0;
+  graph.pwm.length = 0;
+  graph.slip.length = 0;
+}
+
+function drawPlot(canvasId, series, yMin, yMax) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(window.devicePixelRatio || 1, 1);
+  const w = Math.max(240, Math.floor(rect.width * dpr));
+  const h = Math.max(120, Math.floor(rect.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.fillStyle = '#091123';
+  ctx.fillRect(0, 0, w, h);
+
+  const padL = 50 * dpr;
+  const padR = 12 * dpr;
+  const padT = 10 * dpr;
+  const padB = 20 * dpr;
+  const pw = w - padL - padR;
+  const ph = h - padT - padB;
+
+  ctx.strokeStyle = '#1f2a44';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const gy = padT + (ph * i / 4);
+    ctx.beginPath();
+    ctx.moveTo(padL, gy);
+    ctx.lineTo(w - padR, gy);
+    ctx.stroke();
+  }
+
+  ctx.font = `${11 * dpr}px Consolas, monospace`;
+  ctx.fillStyle = '#8aa0bf';
+  for (let i = 0; i <= 4; i++) {
+    const v = yMax - ((yMax - yMin) * i / 4);
+    const gy = padT + (ph * i / 4);
+    ctx.fillText(v.toFixed(0), 4 * dpr, gy + 4 * dpr);
+  }
+
+  const toX = (idx, count) => {
+    if (count <= 1) return padL;
+    return padL + (pw * idx / (count - 1));
+  };
+  const toY = (v) => {
+    const t = (v - yMin) / (yMax - yMin);
+    return padT + ph - (t * ph);
+  };
+
+  for (const s of series) {
+    const data = s.data || [];
+    if (data.length === 0) continue;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = Math.max(1, Math.floor(1.6 * dpr));
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = toX(i, data.length);
+      const y = toY(Math.max(yMin, Math.min(yMax, data[i])));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function updateGraphs(d) {
+  const aw = Number(d.activeWheel) || 0;
+  if (graphActiveWheel !== aw) {
+    graphActiveWheel = aw;
+    clearWheelGraph();
+  }
+
+  const t = Number((d.target && d.target[aw]) || 0);
+  const m = Number((d.measured && d.measured[aw]) || 0);
+  const p = Number((d.pwm && d.pwm[aw]) || 0);
+  const e = t - m;
+
+  pushGraph('target', t);
+  pushGraph('measured', m);
+  pushGraph('err', e);
+  pushGraph('pwm', p);
+  pushGraph('slip', (d.slip && d.slip.detected) ? 240 : 0);
+  pushGraph('yaw', Number((d.imu && d.imu.yawDeg) || 0));
+  pushGraph('headingTarget', Number((d.heading && d.heading.targetDeg) || 0));
+  pushGraph('headingErr', Number((d.heading && d.heading.errorDeg) || 0));
+
+  drawPlot('plot_rpm', [
+    { data: graph.target, color: '#38bdf8' },
+    { data: graph.measured, color: '#22c55e' },
+    { data: graph.err, color: '#ef4444' },
+  ], -65, 65);
+
+  drawPlot('plot_pwm', [
+    { data: graph.pwm, color: '#f97316' },
+    { data: graph.slip, color: '#a855f7' },
+  ], -255, 255);
+
+  drawPlot('plot_heading', [
+    { data: graph.yaw, color: '#10b981' },
+    { data: graph.headingTarget, color: '#f59e0b' },
+    { data: graph.headingErr, color: '#ef4444' },
+  ], -180, 180);
+}
 async function applyConfig(){
   const wheel=document.getElementById('wheel').value;
   const target=document.getElementById('target').value;
@@ -354,20 +1285,141 @@ async function applyConfig(){
   const ki=document.getElementById('ki').value;
   const kd=document.getElementById('kd').value;
   const minpwm=document.getElementById('minpwm').value;
-  await hit(`/cmd/config?wheel=${wheel}&target=${target}&kp=${kp}&ki=${ki}&kd=${kd}&minpwm=${minpwm}`);
+  const alpha=document.getElementById('alpha').value;
+  await hit(`/cmd/config?wheel=${wheel}&target=${target}&kp=${kp}&ki=${ki}&kd=${kd}&minpwm=${minpwm}&alpha=${alpha}`);
+  await refresh();
+}
+async function setMode(){
+  const m=document.getElementById('mode').value;
+  await hit(`/cmd/mode?m=${m}`);
+  await refresh();
+}
+async function applyMotionConfig(){
+  const stepcm=document.getElementById('pos_stepcm').value;
+  const wdcm=document.getElementById('wheel_diam_cm').value;
+  const postol=document.getElementById('pos_tol').value;
+  const pkp=document.getElementById('pos_kp').value;
+  const pki=document.getElementById('pos_ki').value;
+  const pkd=document.getElementById('pos_kd').value;
+  const hyaw=document.getElementById('head_target').value;
+  const hkp=document.getElementById('head_kp').value;
+  const hki=document.getElementById('head_ki').value;
+  const hkd=document.getElementById('head_kd').value;
+  const hmax=document.getElementById('head_max').value;
+  const hhold=document.getElementById('head_hold').value;
+  const hholdmax=document.getElementById('head_hold_max').value;
+  const hholdmin=document.getElementById('head_hold_min').value;
+  const hdb=document.getElementById('head_db').value;
+  const hholddb=document.getElementById('head_hold_db').value;
+  const hhkp=document.getElementById('head_hold_kp').value;
+  const hhki=document.getElementById('head_hold_ki').value;
+  const hhkd=document.getElementById('head_hold_kd').value;
+  const hhoutrate=document.getElementById('head_hold_rate_db').value;
+  const hslew=document.getElementById('head_slew').value;
+  const hsign=document.getElementById('head_sign').value;
+  const alpha=document.getElementById('alpha').value;
+  await hit(`/cmd/motionConfig?stepcm=${stepcm}&wdcm=${wdcm}&postol=${postol}&pkp=${pkp}&pki=${pki}&pkd=${pkd}&hyaw=${hyaw}&hkp=${hkp}&hki=${hki}&hkd=${hkd}&hmax=${hmax}&hhold=${hhold}&hholdmax=${hholdmax}&hholdmin=${hholdmin}&hdb=${hdb}&hholddb=${hholddb}&hhkp=${hhkp}&hhki=${hhki}&hhkd=${hhkd}&hhoutrate=${hhoutrate}&hslew=${hslew}&hsign=${hsign}&alpha=${alpha}`);
+  await refresh();
+}
+async function startYawHold(){
+  const hyaw=document.getElementById('head_target').value;
+  await applyMotionConfig();
+  await hit(`/cmd/yawHoldStart?hyaw=${hyaw}`);
+  await refresh();
+}
+async function startPosStep(dir){
+  const stepcm=document.getElementById('pos_stepcm').value;
+  const wdcm=document.getElementById('wheel_diam_cm').value;
+  await hit(`/cmd/posStep?dir=${dir}&stepcm=${stepcm}&wdcm=${wdcm}`);
+  await refresh();
+}
+async function applyRpmSign(){
+  const m0=document.getElementById('rs0').value;
+  const m1=document.getElementById('rs1').value;
+  const m2=document.getElementById('rs2').value;
+  const m3=document.getElementById('rs3').value;
+  await hit(`/cmd/rpmSign?m0=${m0}&m1=${m1}&m2=${m2}&m3=${m3}`);
+  await refresh();
+}
+async function applySlipConfig(){
+  const en=document.getElementById('slip_en').value;
+  const rpm=document.getElementById('slip_rpm').value;
+  const accg=document.getElementById('slip_accg').value;
+  const detect=document.getElementById('slip_detect').value;
+  const release=document.getElementById('slip_release').value;
+  const maxrpm=document.getElementById('slip_maxrpm').value;
+  const accalpha=document.getElementById('slip_accalpha').value;
+  await hit(`/cmd/slipConfig?en=${en}&rpm=${rpm}&accg=${accg}&detect=${detect}&release=${release}&maxrpm=${maxrpm}&accalpha=${accalpha}`);
   await refresh();
 }
 async function startCtrl(){await hit('/cmd/start'); await refresh();}
 async function stopCtrl(){await hit('/cmd/stop'); await refresh();}
 async function resetI(){await hit('/cmd/resetI'); await refresh();}
 async function resetEnc(){await hit('/cmd/resetEnc'); await refresh();}
+async function imuZero(){await hit('/cmd/imuZero'); await refresh();}
+async function imuCal(){await hit('/cmd/imuCal'); await refresh();}
+async function startRaw(dir){
+  const pwm=document.getElementById('rawpwm').value;
+  const signed = Number(pwm) * Number(dir);
+  await hit(`/cmd/rawStart?pwm=${signed}`);
+  await refresh();
+}
+async function stopRaw(){await hit('/cmd/rawStop'); await refresh();}
+async function startSweep(dir){
+  const s=document.getElementById('ms_start').value;
+  const e=document.getElementById('ms_end').value;
+  const st=document.getElementById('ms_step').value;
+  const h=document.getElementById('ms_hold').value;
+  await hit(`/cmd/minpwmStart?dir=${dir}&start=${s}&end=${e}&step=${st}&hold=${h}`);
+  await refresh();
+}
+async function stopSweep(){await hit('/cmd/minpwmStop'); await refresh();}
 
 async function refresh(){
   const r=await fetch('/data');
   if(!r.ok) return;
   const d=await r.json();
 
-  document.getElementById('status').textContent = `Status: ${d.enabled ? 'RUNNING' : 'STOPPED'} | Active wheel=${d.activeWheel} | Target=${f(d.pidTarget,1)} rpm | Kp=${f(d.kp,2)} Ki=${f(d.ki,2)} Kd=${f(d.kd,2)} MinPWM=${d.minPwm}`;
+  document.getElementById('status').textContent = `Status: ${d.enabled ? 'RUNNING' : 'STOPPED'} | Mode=${d.modeName} | Active wheel=${d.activeWheel} | Target=${f(d.pidTarget,1)} rpm (0..60) | Kp=${f(d.kp,2)} Ki=${f(d.ki,2)} Kd=${f(d.kd,2)} MinPWM=${d.minPwm} | LPF alpha=${f(d.rpmFilterAlpha,2)} | Sign BR/FR/BL/FL=${d.rpmSign[0]}/${d.rpmSign[1]}/${d.rpmSign[2]}/${d.rpmSign[3]}`;
+  document.getElementById('rawStatus').textContent = `Raw mode: ${d.raw.enabled ? 'ACTIVE' : 'IDLE'} | PWM=${d.raw.pwm}`;
+  document.getElementById('motionStatus').textContent = `Position: target=${f(d.position.targetCm,2)} cm (${f(d.position.targetCounts,0)} cnt) | current=${f(d.position.currentCm,2)} cm (${f(d.position.currentCounts,0)} cnt) | error=${f(d.position.errorCm,2)} cm (${f(d.position.errorCounts,0)} cnt) | tol=${f(d.position.tolCm,2)} cm | cmd=${f(d.position.cmdRpm,2)} rpm | done=${d.position.done ? 'YES' : 'NO'} | MoveHeadPID=(${f(d.heading.kp,2)}, ${f(d.heading.ki,2)}, ${f(d.heading.kd,2)}) | HoldHeadPID=(${f(d.heading.holdKp,2)}, ${f(d.heading.holdKi,2)}, ${f(d.heading.holdKd,2)}) | Hold=${d.heading.holdAtStop ? 'ON' : 'OFF'} active=${d.heading.holdActive ? '1' : '0'} stable=${f(d.heading.holdStableMs,0)}ms | hold min/max=${f(d.heading.holdMinRpm,1)}/${f(d.heading.holdMaxRpm,1)} db=${f(d.heading.holdDeadbandDeg,1)}deg`;
+  document.getElementById('imuStatus').textContent = `IMU: ${d.imu.ok ? 'OK' : 'NOT FOUND'} | yaw=${f(d.imu.yawDeg,2)} deg | gyroZ=${f(d.imu.gyroDps,2)} dps | accX=${f(d.imu.accXg,3)}g | accY=${f(d.imu.accYg,3)}g | accXY=${f(d.imu.accXYg,3)}g | bias=${f(d.imu.biasDps,3)} dps | headingErr=${f(d.heading.errorDeg,2)} deg | corr=${f(d.heading.corrRpm,2)} rpm`;
+  document.getElementById('slipStatus').textContent = `Slip: ${d.slip.enabled ? 'ENABLED' : 'DISABLED'} | state=${d.slip.detected ? 'DETECTED' : 'clear'} | candidate=${f(d.slip.candidateMs,0)}ms | avgWheel=${f(d.slip.avgWheelRpm,2)} rpm | rpmThr=${f(d.slip.wheelRpmThresh,1)} | accThr=${f(d.slip.accelThreshG,3)}g | detect=${f(d.slip.detectMs,0)}ms | release=${f(d.slip.releaseMs,0)}ms | maxRPM=${f(d.slip.maxRpm,1)}`;
+
+  const sm=d.minSweep;
+  document.getElementById('sweepStatus').textContent = `Sweep: ${sm.active ? 'ACTIVE' : 'IDLE'} | Dir=${sm.direction > 0 ? 'FWD' : 'REV'} | PWM=${sm.currentPwm} | Range=${sm.startPwm}-${sm.endPwm} step ${sm.stepPwm} | Hold=${sm.holdMs}ms | AvgAbsRPM=${f(sm.avgAbsRpm,2)} | Detected=${sm.detectedPwm}`;
+
+  syncFieldValue('mode', d.mode);
+  syncFieldValue('rs0', d.rpmSign[0]);
+  syncFieldValue('rs1', d.rpmSign[1]);
+  syncFieldValue('rs2', d.rpmSign[2]);
+  syncFieldValue('rs3', d.rpmSign[3]);
+  syncFieldValue('slip_en', d.slip.enabled ? '1' : '0');
+  syncFieldValue('slip_rpm', f(d.slip.wheelRpmThresh,1));
+  syncFieldValue('slip_accg', f(d.slip.accelThreshG,3));
+  syncFieldValue('slip_detect', f(d.slip.detectMs,0));
+  syncFieldValue('slip_release', f(d.slip.releaseMs,0));
+  syncFieldValue('slip_maxrpm', f(d.slip.maxRpm,1));
+  syncFieldValue('slip_accalpha', f(d.imu.accAlpha,2));
+  syncFieldValue('pos_stepcm', f(d.position.stepCm,2));
+  syncFieldValue('wheel_diam_cm', f(d.position.wheelDiameterCm,2));
+  syncFieldValue('pos_tol', f(d.position.tolCounts,0));
+  syncFieldValue('head_target', f(d.heading.targetDeg,1));
+  syncFieldValue('head_kp', f(d.heading.kp,2));
+  syncFieldValue('head_ki', f(d.heading.ki,3));
+  syncFieldValue('head_kd', f(d.heading.kd,3));
+  syncFieldValue('head_max', f(d.heading.maxCorrRpm,1));
+  syncFieldValue('head_sign', String(d.heading.sign));
+  syncFieldValue('head_hold', d.heading.holdAtStop ? '1' : '0');
+  syncFieldValue('head_hold_max', f(d.heading.holdMaxRpm,1));
+  syncFieldValue('head_hold_min', f(d.heading.holdMinRpm,1));
+  syncFieldValue('head_db', f(d.heading.deadbandDeg,1));
+  syncFieldValue('head_hold_db', f(d.heading.holdDeadbandDeg,1));
+  syncFieldValue('head_hold_kp', f(d.heading.holdKp,2));
+  syncFieldValue('head_hold_ki', f(d.heading.holdKi,2));
+  syncFieldValue('head_hold_kd', f(d.heading.holdKd,2));
+  syncFieldValue('head_hold_rate_db', f(d.heading.holdExitRateDps,2));
+  syncFieldValue('head_slew', f(d.heading.corrSlewRpmPerSec,1));
 
   for(let i=0;i<4;i++){
     document.getElementById('rpm'+i).textContent=f(d.measured[i],1);
@@ -376,6 +1428,8 @@ async function refresh(){
     document.getElementById('er'+i).textContent=f(d.target[i]-d.measured[i],1);
     document.getElementById('pw'+i).textContent=d.pwm[i];
   }
+
+  updateGraphs(d);
 }
 setInterval(refresh, 200);
 refresh();
@@ -388,12 +1442,107 @@ refresh();
 String jsonData() {
   String s = "{";
   s += "\"enabled\":" + String(controllerEnabled ? "true" : "false") + ",";
+  s += "\"mode\":" + String((int)controlMode) + ",";
+  s += "\"modeName\":\"" + String(controlMode == MODE_POSITION_HEADING ? "position+heading" : "single-wheel velocity") + "\",";
   s += "\"activeWheel\":" + String(activeWheel) + ",";
   s += "\"pidTarget\":" + String(pidTargetRpm, 3) + ",";
   s += "\"kp\":" + String(pid[activeWheel].kp, 4) + ",";
   s += "\"ki\":" + String(pid[activeWheel].ki, 4) + ",";
   s += "\"kd\":" + String(pid[activeWheel].kd, 4) + ",";
   s += "\"minPwm\":" + String(minPwm) + ",";
+  s += "\"rpmFilterAlpha\":" + String(rpmFilterAlpha, 3) + ",";
+
+  s += "\"rpmSign\":[";
+  for (uint8_t i = 0; i < 4; i++) {
+    s += String(rpmSign[i]);
+    if (i < 3) s += ",";
+  }
+  s += "],";
+
+  s += "\"raw\":{";
+  s += "\"enabled\":" + String(rawModeEnabled ? "true" : "false") + ",";
+  s += "\"pwm\":" + String(rawPwmCmd);
+  s += "},";
+
+  s += "\"minSweep\":{";
+  s += "\"active\":" + String(minSweep.active ? "true" : "false") + ",";
+  s += "\"direction\":" + String(minSweep.direction) + ",";
+  s += "\"startPwm\":" + String(minSweep.startPwm) + ",";
+  s += "\"endPwm\":" + String(minSweep.endPwm) + ",";
+  s += "\"stepPwm\":" + String(minSweep.stepPwm) + ",";
+  s += "\"holdMs\":" + String(minSweep.holdMs) + ",";
+  s += "\"currentPwm\":" + String(minSweep.currentPwm) + ",";
+  s += "\"detectedPwm\":" + String(minSweep.detectedPwm) + ",";
+  s += "\"avgAbsRpm\":" + String(minSweep.avgAbsRpm, 3);
+  s += "},";
+
+  s += "\"imu\":{";
+  s += "\"ok\":" + String(imuOk ? "true" : "false") + ",";
+  s += "\"yawDeg\":" + String(imuYawDeg, 3) + ",";
+  s += "\"gyroDps\":" + String(imuGyroDps, 3) + ",";
+  s += "\"accXg\":" + String(imuAccXg, 4) + ",";
+  s += "\"accYg\":" + String(imuAccYg, 4) + ",";
+  s += "\"accXYg\":" + String(imuAccXYg, 4) + ",";
+  s += "\"accAlpha\":" + String(imuAccAlpha, 3) + ",";
+  s += "\"biasDps\":" + String(imuBiasDps, 4);
+  s += "},";
+
+  s += "\"slip\":{";
+  s += "\"enabled\":" + String(slipEnabled ? "true" : "false") + ",";
+  s += "\"detected\":" + String(slipDetected ? "true" : "false") + ",";
+  s += "\"candidateMs\":" + String(slipCandidateMs, 1) + ",";
+  s += "\"wheelRpmThresh\":" + String(slipWheelRpmThresh, 3) + ",";
+  s += "\"accelThreshG\":" + String(slipAccelThreshG, 4) + ",";
+  s += "\"detectMs\":" + String(slipDetectMs, 1) + ",";
+  s += "\"releaseMs\":" + String(slipReleaseMs, 1) + ",";
+  s += "\"maxRpm\":" + String(slipMaxRpm, 3) + ",";
+  s += "\"avgWheelRpm\":" + String(slipAvgWheelRpm, 3);
+  s += "},";
+
+  s += "\"position\":{";
+  s += "\"targetCounts\":" + String(positionTargetCounts, 3) + ",";
+  s += "\"currentCounts\":" + String(positionCurrentCounts, 3) + ",";
+  s += "\"errorCounts\":" + String(positionErrorCounts, 3) + ",";
+  s += "\"targetCm\":" + String(countsToCm(positionTargetCounts), 3) + ",";
+  s += "\"currentCm\":" + String(countsToCm(positionCurrentCounts), 3) + ",";
+  s += "\"errorCm\":" + String(countsToCm(positionErrorCounts), 3) + ",";
+  s += "\"stepCm\":" + String(positionStepCm, 3) + ",";
+  s += "\"wheelDiameterCm\":" + String(wheelDiameterCm, 3) + ",";
+  s += "\"tolCounts\":" + String(positionTolCounts, 3) + ",";
+  s += "\"tolCm\":" + String(countsToCm(positionTolCounts), 3) + ",";
+  s += "\"cmdRpm\":" + String(positionCmdRpm, 3) + ",";
+  s += "\"done\":" + String(positionDone ? "true" : "false") + ",";
+  s += "\"kp\":" + String(posPid.kp, 5) + ",";
+  s += "\"ki\":" + String(posPid.ki, 5) + ",";
+  s += "\"kd\":" + String(posPid.kd, 5);
+  s += "},";
+
+  s += "\"heading\":{";
+  s += "\"targetDeg\":" + String(headingTargetDeg, 3) + ",";
+  s += "\"errorDeg\":" + String(headingErrorDeg, 3) + ",";
+  s += "\"corrRpm\":" + String(headingCorrRpm, 3) + ",";
+  s += "\"maxCorrRpm\":" + String(headingCorrMaxRpm, 3) + ",";
+  s += "\"holdMaxRpm\":" + String(headingHoldMaxRpm, 3) + ",";
+  s += "\"holdMinRpm\":" + String(headingHoldMinRpm, 3) + ",";
+  s += "\"holdEnterDeg\":" + String(headingHoldEnterDeg, 3) + ",";
+  s += "\"holdExitDeg\":" + String(headingHoldExitDeg, 3) + ",";
+  s += "\"holdExitRateDps\":" + String(headingHoldExitRateDps, 3) + ",";
+  s += "\"holdActive\":" + String(headingHoldActive ? "true" : "false") + ",";
+  s += "\"holdStableMs\":" + String(headingHoldStableMs, 1) + ",";
+  s += "\"corrSlewRpmPerSec\":" + String(headingCorrSlewRpmPerSec, 3) + ",";
+  s += "\"deadbandDeg\":" + String(headingDeadbandDeg, 3) + ",";
+  s += "\"holdDeadbandDeg\":" + String(headingHoldDeadbandDeg, 3) + ",";
+  s += "\"enableBaseRpm\":" + String(headingEnableBaseRpm, 3) + ",";
+  s += "\"sign\":" + String(headingCorrSign) + ",";
+  s += "\"autoLock\":" + String(autoLockHeadingOnStep ? "true" : "false") + ",";
+  s += "\"holdAtStop\":" + String(holdHeadingAtStop ? "true" : "false") + ",";
+  s += "\"kp\":" + String(headingPid.kp, 5) + ",";
+  s += "\"ki\":" + String(headingPid.ki, 5) + ",";
+  s += "\"kd\":" + String(headingPid.kd, 5) + ",";
+  s += "\"holdKp\":" + String(headingHoldPid.kp, 5) + ",";
+  s += "\"holdKi\":" + String(headingHoldPid.ki, 5) + ",";
+  s += "\"holdKd\":" + String(headingHoldPid.kd, 5);
+  s += "},";
 
   s += "\"target\":[";
   for (uint8_t i = 0; i < 4; i++) {
@@ -402,9 +1551,17 @@ String jsonData() {
   }
   s += "],";
 
+  // measuredRpm[] is already in motor order [MOTA, MOTB, MOTC, MOTD]
   s += "\"measured\":[";
   for (uint8_t i = 0; i < 4; i++) {
     s += String(measuredRpm[i], 3);
+    if (i < 3) s += ",";
+  }
+  s += "],";
+
+  s += "\"measuredRaw\":[";
+  for (uint8_t i = 0; i < 4; i++) {
+    s += String(measuredRpmRaw[i], 3);
     if (i < 3) s += ",";
   }
   s += "],";
@@ -428,17 +1585,63 @@ void handleData() {
   server.send(200, "application/json", jsonData());
 }
 
+void handleRpmSign() {
+  for (uint8_t i = 0; i < 4; i++) {
+    String argName = String("m") + String(i);
+    if (server.hasArg(argName)) {
+      int s = server.arg(argName).toInt();
+      rpmSign[i] = (s >= 0) ? 1 : -1;
+    }
+  }
+
+  resetAllPidStates();
+  server.send(200, "text/plain", "RPM sign updated");
+}
+
+void handleSlipConfig() {
+  if (server.hasArg("en")) {
+    slipEnabled = server.arg("en").toInt() != 0;
+  }
+  if (server.hasArg("rpm")) {
+    slipWheelRpmThresh = constrain(server.arg("rpm").toFloat(), 1.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("accg")) {
+    slipAccelThreshG = constrain(server.arg("accg").toFloat(), 0.001f, 1.5f);
+  }
+  if (server.hasArg("detect")) {
+    slipDetectMs = constrain(server.arg("detect").toFloat(), 80.0f, 3000.0f);
+  }
+  if (server.hasArg("release")) {
+    slipReleaseMs = constrain(server.arg("release").toFloat(), 40.0f, 3000.0f);
+  }
+  if (server.hasArg("maxrpm")) {
+    slipMaxRpm = constrain(server.arg("maxrpm").toFloat(), 0.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("accalpha")) {
+    imuAccAlpha = constrain(server.arg("accalpha").toFloat(), 0.02f, 1.0f);
+  }
+
+  if (!slipEnabled) {
+    slipDetected = false;
+    slipCandidateMs = 0.0f;
+  }
+
+  server.send(200, "text/plain", "Slip config applied");
+}
+
 void handleConfig() {
+  bool wheelChanged = false;
   if (server.hasArg("wheel")) {
     int w = server.arg("wheel").toInt();
     if (w >= 0 && w < 4) {
+      wheelChanged = (activeWheel != (uint8_t)w);
       activeWheel = (uint8_t)w;
     }
   }
 
   if (server.hasArg("target")) {
     pidTargetRpm = server.arg("target").toFloat();
-    pidTargetRpm = constrain(pidTargetRpm, -80.0f, 80.0f);
+    pidTargetRpm = constrain(pidTargetRpm, 0.0f, TARGET_RPM_MAX);
   }
 
   if (server.hasArg("kp")) {
@@ -456,23 +1659,262 @@ void handleConfig() {
 
   if (server.hasArg("minpwm")) {
     int v = server.arg("minpwm").toInt();
-    minPwm = (uint8_t)constrain(v, 0, 180);
+    minPwm = (uint8_t)constrain(v, 0, PWM_MAX);
+  }
+
+  if (server.hasArg("alpha")) {
+    float a = server.arg("alpha").toFloat();
+    rpmFilterAlpha = constrain(a, 0.02f, 1.0f);
+  }
+
+  if (rawModeEnabled && wheelChanged) {
+    stopAllMotors();
+    setMotorPwmSigned(activeWheel, rawPwmCmd);
   }
 
   updateTargets();
   server.send(200, "text/plain", "Config applied");
 }
 
+void handleMode() {
+  if (server.hasArg("m")) {
+    String m = server.arg("m");
+    if (m == "1" || m == "pos" || m == "position") {
+      controlMode = MODE_POSITION_HEADING;
+    } else {
+      controlMode = MODE_SINGLE_WHEEL_VELOCITY;
+    }
+  }
+
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
+
+  resetHighLevelControllers();
+  updateTargets();
+  server.send(200, "text/plain", controlMode == MODE_POSITION_HEADING ? "Mode: POSITION+HEADING" : "Mode: SINGLE-WHEEL VELOCITY");
+}
+
+void handleMotionConfig() {
+  if (server.hasArg("pos")) {
+    positionTargetCounts = server.arg("pos").toFloat();
+    positionDone = false;
+    positionDoneTicks = 0;
+  }
+  if (server.hasArg("stepcm")) {
+    positionStepCm = constrain(server.arg("stepcm").toFloat(), -1000.0f, 1000.0f);
+  }
+  if (server.hasArg("wdcm")) {
+    wheelDiameterCm = constrain(server.arg("wdcm").toFloat(), 1.0f, 30.0f);
+  }
+  if (server.hasArg("postol")) {
+    positionTolCounts = server.arg("postol").toFloat();
+    positionTolCounts = constrain(positionTolCounts, 1.0f, 2000.0f);
+  }
+
+  if (server.hasArg("pkp")) posPid.kp = server.arg("pkp").toFloat();
+  if (server.hasArg("pki")) posPid.ki = server.arg("pki").toFloat();
+  if (server.hasArg("pkd")) posPid.kd = server.arg("pkd").toFloat();
+
+  if (server.hasArg("hyaw")) {
+    headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
+  }
+  if (server.hasArg("hkp")) headingPid.kp = server.arg("hkp").toFloat();
+  if (server.hasArg("hki")) headingPid.ki = server.arg("hki").toFloat();
+  if (server.hasArg("hkd")) headingPid.kd = server.arg("hkd").toFloat();
+  if (server.hasArg("hhkp")) headingHoldPid.kp = server.arg("hhkp").toFloat();
+  if (server.hasArg("hhki")) headingHoldPid.ki = server.arg("hhki").toFloat();
+  if (server.hasArg("hhkd")) headingHoldPid.kd = server.arg("hhkd").toFloat();
+  if (server.hasArg("hmax")) {
+    headingCorrMaxRpm = server.arg("hmax").toFloat();
+    headingCorrMaxRpm = constrain(headingCorrMaxRpm, 0.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("hholdmax")) {
+    headingHoldMaxRpm = server.arg("hholdmax").toFloat();
+    headingHoldMaxRpm = constrain(headingHoldMaxRpm, 0.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("hholdmin")) {
+    headingHoldMinRpm = constrain(server.arg("hholdmin").toFloat(), 0.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("hhoutrate")) {
+    headingHoldExitRateDps = constrain(server.arg("hhoutrate").toFloat(), 0.0f, 40.0f);
+  }
+  if (server.hasArg("hslew")) {
+    headingCorrSlewRpmPerSec = constrain(server.arg("hslew").toFloat(), 0.0f, 400.0f);
+  }
+  if (server.hasArg("hsign")) {
+    int s = server.arg("hsign").toInt();
+    headingCorrSign = (s >= 0) ? 1 : -1;
+  }
+  if (server.hasArg("hdb")) {
+    headingDeadbandDeg = constrain(server.arg("hdb").toFloat(), 0.0f, 30.0f);
+  }
+  if (server.hasArg("hholddb")) {
+    headingHoldDeadbandDeg = constrain(server.arg("hholddb").toFloat(), 0.0f, 30.0f);
+  }
+  if (server.hasArg("hbase")) {
+    headingEnableBaseRpm = constrain(server.arg("hbase").toFloat(), 0.0f, TARGET_RPM_MAX);
+  }
+  if (server.hasArg("hhold")) {
+    holdHeadingAtStop = server.arg("hhold").toInt() != 0;
+  }
+
+  if (server.hasArg("alpha")) {
+    float a = server.arg("alpha").toFloat();
+    rpmFilterAlpha = constrain(a, 0.02f, 1.0f);
+  }
+
+  if (headingHoldMinRpm > headingHoldMaxRpm) {
+    headingHoldMinRpm = headingHoldMaxRpm;
+  }
+
+  resetHighLevelControllers();
+  server.send(200, "text/plain", "Motion config applied");
+}
+
+void handleYawHoldStart() {
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
+
+  if (server.hasArg("hyaw")) {
+    headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
+  }
+
+  positionTargetCounts = getAverageMotorEncoderCount();
+  controlMode = MODE_POSITION_HEADING;
+  controllerEnabled = true;
+  resetHighLevelControllers();
+  positionDone = true;
+  positionDoneTicks = 5;
+
+  String msg = "Yaw hold active | targetDeg=" + String(headingTargetDeg, 2);
+  server.send(200, "text/plain", msg);
+}
+
+void handlePositionStep() {
+  int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
+  float stepCm = positionStepCm;
+  if (server.hasArg("stepcm")) {
+    stepCm = constrain(server.arg("stepcm").toFloat(), -1000.0f, 1000.0f);
+  }
+  if (server.hasArg("wdcm")) {
+    wheelDiameterCm = constrain(server.arg("wdcm").toFloat(), 1.0f, 30.0f);
+  }
+  positionStepCm = stepCm;
+
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
+
+  float current = getAverageMotorEncoderCount();
+  float stepCounts = cmToCounts(fabsf(stepCm));
+  int8_t sign = (dir >= 0) ? 1 : -1;
+  if (stepCm < 0.0f) {
+    sign = -sign;
+  }
+
+  if (imuOk && autoLockHeadingOnStep) {
+    headingTargetDeg = imuYawDeg;
+  }
+
+  positionTargetCounts = current + ((float)sign) * stepCounts;
+  controllerEnabled = true;
+  controlMode = MODE_POSITION_HEADING;
+  resetHighLevelControllers();
+
+  String msg = "Position step started | stepCm=" + String(positionStepCm, 2) + " | targetCounts=" + String(positionTargetCounts, 1);
+  server.send(200, "text/plain", msg);
+}
+
+void handleImuZero() {
+  imuZeroYaw();
+  resetCascadePid(headingPid);
+  server.send(200, "text/plain", "IMU yaw zeroed");
+}
+
+void handleImuCal() {
+  bool ok = imuCalibrateBias(500);
+  server.send(200, "text/plain", ok ? "IMU bias calibrated" : "IMU calibration failed");
+}
+
+void handleRawStart() {
+  int pwm = server.hasArg("pwm") ? server.arg("pwm").toInt() : PWM_MAX;
+  startRawMode((int16_t)pwm);
+  server.send(200, "text/plain", "Raw mode started");
+}
+
+void handleRawStop() {
+  stopRawMode();
+  server.send(200, "text/plain", "Raw mode stopped");
+}
+
+void handleMinPwmStart() {
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+
+  int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
+  int start = server.hasArg("start") ? server.arg("start").toInt() : 20;
+  int end = server.hasArg("end") ? server.arg("end").toInt() : 90;
+  int step = server.hasArg("step") ? server.arg("step").toInt() : 2;
+  int hold = server.hasArg("hold") ? server.arg("hold").toInt() : 700;
+
+  startMinPwmSweep((dir >= 0) ? 1 : -1, (uint8_t)start, (uint8_t)end, (uint8_t)step, (uint16_t)hold);
+  server.send(200, "text/plain", "MinPWM sweep started");
+}
+
+void handleMinPwmStop() {
+  stopMinPwmSweep();
+  server.send(200, "text/plain", "MinPWM sweep stopped");
+}
+
 void handleStart() {
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
+
+  resetHighLevelControllers();
+
+  if (controlMode == MODE_POSITION_HEADING) {
+    // In Mode 1, Start means execute one relative distance step from current pose.
+    float current = getAverageMotorEncoderCount();
+    if (imuOk && autoLockHeadingOnStep) {
+      headingTargetDeg = imuYawDeg;
+    }
+    positionTargetCounts = current + cmToCounts(positionStepCm);
+  }
+
   controllerEnabled = true;
   updateTargets();
   server.send(200, "text/plain", "Controller started");
 }
 
 void handleStop() {
+  if (rawModeEnabled) {
+    stopRawMode();
+  }
+
+  if (minSweep.active) {
+    stopMinPwmSweep();
+  }
   controllerEnabled = false;
   updateTargets();
   resetAllPidStates();
+  resetHighLevelControllers();
   stopAllMotors();
   server.send(200, "text/plain", "Controller stopped");
 }
@@ -490,6 +1932,8 @@ void handleResetEnc() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  imuInit();
 
   for (uint8_t i = 0; i < 4; i++) {
     setupEncoderPin(encoders[i].a);
@@ -522,10 +1966,22 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/data", HTTP_GET, handleData);
   server.on("/cmd/config", HTTP_GET, handleConfig);
+  server.on("/cmd/rpmSign", HTTP_GET, handleRpmSign);
+  server.on("/cmd/slipConfig", HTTP_GET, handleSlipConfig);
+  server.on("/cmd/mode", HTTP_GET, handleMode);
+  server.on("/cmd/motionConfig", HTTP_GET, handleMotionConfig);
+  server.on("/cmd/posStep", HTTP_GET, handlePositionStep);
+  server.on("/cmd/yawHoldStart", HTTP_GET, handleYawHoldStart);
+  server.on("/cmd/imuZero", HTTP_GET, handleImuZero);
+  server.on("/cmd/imuCal", HTTP_GET, handleImuCal);
   server.on("/cmd/start", HTTP_GET, handleStart);
   server.on("/cmd/stop", HTTP_GET, handleStop);
   server.on("/cmd/resetI", HTTP_GET, handleResetI);
   server.on("/cmd/resetEnc", HTTP_GET, handleResetEnc);
+  server.on("/cmd/rawStart", HTTP_GET, handleRawStart);
+  server.on("/cmd/rawStop", HTTP_GET, handleRawStop);
+  server.on("/cmd/minpwmStart", HTTP_GET, handleMinPwmStart);
+  server.on("/cmd/minpwmStop", HTTP_GET, handleMinPwmStop);
   server.begin();
 
   Serial.println();
@@ -538,6 +1994,8 @@ void setup() {
   Serial.println(AP_PASS);
   Serial.print("IP: ");
   Serial.println(WiFi.softAPIP());
+  Serial.print("IMU: ");
+  Serial.println(imuOk ? "OK" : "NOT FOUND");
 }
 
 void loop() {
@@ -549,8 +2007,16 @@ void loop() {
     lastControlMs = now;
     if (dt < 0.001f) dt = CONTROL_INTERVAL_MS / 1000.0f;
 
-    updateTargets();
-    runControlLoop(dt);
+    if (minSweep.active) {
+      updateMeasuredRpm(dt);
+      updateMinPwmSweep(now);
+    } else if (rawModeEnabled) {
+      updateMeasuredRpm(dt);
+      stopAllMotors();
+      setMotorPwmSigned(activeWheel, rawPwmCmd);
+    } else {
+      runControlLoop(dt);
+    }
   }
 
   if (now - lastPrintMs >= 1000) {
@@ -570,6 +2036,22 @@ void loop() {
     Serial.print(",");
     Serial.print(pwmCmd[2]);
     Serial.print(",");
-    Serial.println(pwmCmd[3]);
+    Serial.print(pwmCmd[3]);
+    Serial.print(" | MinSweep active=");
+    Serial.print(minSweep.active ? "1" : "0");
+    Serial.print(" current=");
+    Serial.print(minSweep.currentPwm);
+    Serial.print(" detected=");
+    Serial.print(minSweep.detectedPwm);
+    Serial.print(" | Raw=");
+    Serial.print(rawModeEnabled ? "1" : "0");
+    Serial.print(" pwm=");
+    Serial.print(rawPwmCmd);
+    Serial.print(" | Mode=");
+    Serial.print(controlMode == MODE_POSITION_HEADING ? "POS" : "VEL");
+    Serial.print(" | Yaw=");
+    Serial.print(imuYawDeg, 1);
+    Serial.print(" | PosErr=");
+    Serial.println(positionErrorCounts, 1);
   }
 }
