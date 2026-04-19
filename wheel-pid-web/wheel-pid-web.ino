@@ -181,7 +181,7 @@ bool holdHeadingAtStop = true;
 bool yawHoldInPlaceMode = false;
 float headingHoldMaxRpm = 10.0f;
 float headingHoldDeadbandDeg = 2.0f;
-CascadePidState headingHoldPid = {0.65f, 0.00f, 1.20f, 0.0f, 0.0f, 0.0f};
+CascadePidState headingHoldPid = {0.65f, 0.08f, 1.20f, 0.0f, 0.0f, 0.0f};
 float headingHoldMinRpm = 1.2f;  // legacy, no longer used in control loop
 uint8_t holdMinPwm = 0;          // kept for UI compatibility; intentionally not used in hold control
 float headingHoldEnterDeg = 5.0f;
@@ -189,12 +189,17 @@ float headingHoldExitDeg = 1.0f;
 float headingHoldExitRateDps = 2.5f;
 float headingHoldKickErrDeg = 10.0f;
 float headingHoldKickGyroDps = 1.0f;
+float yawHoldInPlaceKiScale = 0.50f;
+float yawHoldInPlaceKiErrDeg = 8.0f;
 float headingCorrSlewRpmPerSec = 70.0f;
 bool headingHoldActive = false;
 float headingHoldStableMs = 0.0f;
 float headingCorrCmdPrev = 0.0f;
 bool headingErrSettledLatch = false;
 bool headingRateSettledLatch = false;
+float turnOvershootDeg = 4.5f;
+float poseMoveRequestedYawDeg = 0.0f;
+float poseMoveAppliedBiasDeg = 0.0f;
 
 // Sequenced move command state: first rotate to heading, then drive distance while holding heading.
 bool poseMoveActive = false;
@@ -206,15 +211,17 @@ uint32_t poseMovePhaseStartMs = 0;
 uint32_t poseMoveTurnTimeoutMs = 12000;
 uint8_t poseMoveLastResult = 0;  // 0=none, 1=completed, 2=turn-timeout, 3=imu-missing
 float poseMoveTurnNearMs = 0.0f;
+float poseMoveTurnCloseMs = 0.0f;
+bool poseMoveTurnOnly = false;
 
 // Wheel-loop gain scheduling for gentle yaw hold behavior.
 float yawHoldWheelKpScale = 0.78f;
-float yawHoldWheelKdScale = 0.08f;
-int16_t yawHoldWheelPwmMax = 255;
+float yawHoldWheelKdScale = 0.06f;
+int16_t yawHoldWheelPwmMax = 200;
 float yawHoldTargetDeadbandRpm = 1.0f;
-uint8_t yawHoldBreakawayPwm = 12;
+uint8_t yawHoldBreakawayPwm = 8;
 float yawHoldBreakawayErrDeg = 9.0f;
-float yawHoldWheelPwmSlewPerSec = 900.0f;
+float yawHoldWheelPwmSlewPerSec = 550.0f;
 int16_t yawHoldWheelCmdPrev[4] = {0, 0, 0, 0};
 
 // In-place yaw speed profile: cruise fast, then transition to a low-speed final capture zone near target.
@@ -288,6 +295,20 @@ float shortestAngleErrorDeg(float targetDeg, float currentDeg) {
   return atan2f(sinf(d), cosf(d)) * RAD_TO_DEG;
 }
 
+float applyTurnOvershootComp(float requestedYawDeg, float currentYawDeg, float maxBiasDeg, float* appliedBiasDegOut = nullptr) {
+  float requested = wrapAngleDeg(requestedYawDeg);
+  float absBias = fabsf(maxBiasDeg);
+  float err = shortestAngleErrorDeg(requested, currentYawDeg);
+  float applied = 0.0f;
+  if (absBias > 0.001f && fabsf(err) > 0.8f) {
+    applied = (err >= 0.0f ? absBias : -absBias);
+  }
+  if (appliedBiasDegOut) {
+    *appliedBiasDegOut = applied;
+  }
+  return wrapAngleDeg(requested + applied);
+}
+
 uint32_t computePoseTurnTimeoutMs(float targetYawDeg, float currentYawDeg, float maxTurnRpm) {
   // Estimate timeout from angular distance and available turn authority,
   // then add margin so normal settling is not treated as failure.
@@ -342,6 +363,7 @@ void resetHighLevelControllers() {
   debugCorrTargetRpm = 0.0f;
   debugCorrAfterSlewRpm = 0.0f;
   poseMoveTurnNearMs = 0.0f;
+  poseMoveTurnCloseMs = 0.0f;
   for (uint8_t i = 0; i < 4; i++) {
     yawHoldWheelCmdPrev[i] = 0;
   }
@@ -358,6 +380,10 @@ void cancelPoseMove(uint8_t resultCode = 0) {
   poseMoveTargetCounts = 0.0f;
   poseMovePhaseStartMs = 0;
   poseMoveTurnNearMs = 0.0f;
+  poseMoveTurnCloseMs = 0.0f;
+  poseMoveTurnOnly = false;
+  poseMoveRequestedYawDeg = headingTargetDeg;
+  poseMoveAppliedBiasDeg = 0.0f;
 }
 
 bool imuWriteReg(uint8_t reg, uint8_t value) {
@@ -702,11 +728,17 @@ void updateHighLevelTargets(float dt) {
         // Stable hold correction: P on deadbanded error, D on filtered yaw-rate.
         float uHold = headingHoldPid.kp * errHold - headingHoldPid.kd * imuGyroDpsFilt;
 
-        // Keep hold I-term disabled in dedicated in-place yaw mode to avoid large-angle limit cycles.
-        float holdKiEff = yawHoldInPlaceMode ? 0.0f : headingHoldPid.ki;
-        if (fabsf(holdKiEff) > 0.0001f && fabsf(errHold) < 6.0f) {
+        // In-place mode uses a reduced Ki so bias can be corrected without reintroducing hard oscillation.
+        float holdKiEff = headingHoldPid.ki;
+        float holdKiErrBand = 6.0f;
+        if (yawHoldInPlaceMode) {
+          holdKiEff *= yawHoldInPlaceKiScale;
+          holdKiErrBand = max(4.0f, yawHoldInPlaceKiErrDeg);
+        }
+        if (fabsf(holdKiEff) > 0.0001f && fabsf(errHold) < holdKiErrBand) {
           headingHoldPid.integral += errHold * dt;
-          headingHoldPid.integral = constrain(headingHoldPid.integral, -20.0f, 20.0f);
+          float iLim = yawHoldInPlaceMode ? 24.0f : 20.0f;
+          headingHoldPid.integral = constrain(headingHoldPid.integral, -iLim, iLim);
           uHold += holdKiEff * headingHoldPid.integral;
         } else {
           headingHoldPid.integral = 0.0f;
@@ -741,6 +773,8 @@ void updateHighLevelTargets(float dt) {
           // Near target, cap authority to avoid violent cross-over oscillation.
           if (absRawErr <= finalCapDeg) {
             holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm, yawHoldFinalMinRpm + 0.6f));
+          } else if (absRawErr <= (finalCapDeg + 4.0f)) {
+            holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm + 0.8f, 4.5f));
           }
           corrTarget = constrain(corrTarget, -holdMaxEff, holdMaxEff);
 
@@ -804,20 +838,45 @@ void updateHighLevelTargets(float dt) {
     if (poseMovePhase == 1) {
       float absHeadingErr = fabsf(headingErrorDeg);
       float absGyro = fabsf(imuGyroDpsFilt);
-      bool nearHeadingAndSlow = (absHeadingErr <= 4.0f) && (absGyro <= 2.5f);
+      bool nearHeadingAndSlow = (absHeadingErr <= 3.0f) && (absGyro <= 3.0f);
+      bool closeHeadingBand = (absHeadingErr <= 5.0f);
       if (nearHeadingAndSlow) {
         poseMoveTurnNearMs += dt * 1000.0f;
       } else {
         poseMoveTurnNearMs = 0.0f;
       }
+      if (closeHeadingBand) {
+        poseMoveTurnCloseMs += dt * 1000.0f;
+      } else {
+        poseMoveTurnCloseMs = 0.0f;
+      }
 
-      bool headingSettledNow = (debugErrSettled && debugRateSettled && (headingHoldStableMs >= headingHoldSettleHoldMs)) ||
-                               (poseMoveTurnNearMs >= 450.0f);
+      bool strictSettled = debugErrSettled && debugRateSettled && (headingHoldStableMs >= headingHoldSettleHoldMs);
+      bool nearSlowSettled = (poseMoveTurnNearMs >= 300.0f);
+      bool closeBandSettled = (poseMoveTurnCloseMs >= 1200.0f);
+      bool headingSettledNow = false;
+      if (poseMoveTurnOnly) {
+        // For pure turn commands, require tighter completion to avoid stopping several degrees short.
+        headingSettledNow = strictSettled || (nearSlowSettled && (absHeadingErr <= 2.2f));
+      } else {
+        headingSettledNow = strictSettled || nearSlowSettled || closeBandSettled;
+      }
       if (headingSettledNow) {
+        if (poseMoveTurnOnly) {
+          // For zero-distance commands, complete immediately after turn settle.
+          controllerEnabled = false;
+          yawHoldInPlaceMode = false;
+          headingCorrCmdPrev = 0.0f;
+          stopAllMotors();
+          cancelPoseMove(1);
+          return;
+        }
+
         // Start drive phase once heading is stably aligned.
         poseMovePhase = 2;
         poseMovePhaseStartMs = millis();
         poseMoveTurnNearMs = 0.0f;
+        poseMoveTurnCloseMs = 0.0f;
         yawHoldInPlaceMode = false;
         headingCorrCmdPrev = 0.0f;
         resetCascadePid(headingHoldPid);
@@ -1154,6 +1213,14 @@ void runControlLoop(float dt) {
 
     int cmd = (int)lroundf(u);
     int maxPwm = yawHoldWheelMode ? constrain((int)yawHoldWheelPwmMax, 0, PWM_MAX) : PWM_MAX;
+    if (yawHoldWheelMode && yawHoldInPlaceMode) {
+      float absErr = fabsf(debugRawHeadingErrDeg);
+      if (absErr < 6.0f) {
+        maxPwm = min(maxPwm, 90);
+      } else if (absErr < 12.0f) {
+        maxPwm = min(maxPwm, 130);
+      }
+    }
     cmd = constrain(cmd, -maxPwm, maxPwm);
 
     // Basic anti-windup: if saturated and the error would push further into saturation,
@@ -1314,6 +1381,7 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
     <div class="row" style="margin-top:8px">
       <label>Target Heading (deg)</label><input id="head_target" type="number" value="0" step="1" min="-180" max="180" onchange="applyMotionConfig()" />
       <label>Head Kp</label><input id="head_kp" type="number" value="1.80" step="0.05" onchange="applyMotionConfig()" />
+      <label>Head Ki</label><input id="head_ki" type="number" value="0.00" step="0.01" onchange="applyMotionConfig()" />
       <label>Head Kd</label><input id="head_kd" type="number" value="0.08" step="0.01" onchange="applyMotionConfig()" />
       <label>Max Head Corr RPM</label><input id="head_max" type="number" value="20" step="1" min="0" max="60" onchange="applyMotionConfig()" />
       <label>Hold At Stop</label>
@@ -1321,7 +1389,10 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
       <label>Hold Max Corr RPM</label><input id="head_hold_max" type="number" value="10" step="0.5" min="0" max="60" onchange="applyMotionConfig()" />
       <label>Hold Deadband (deg)</label><input id="head_hold_db" type="number" value="2.0" step="0.1" min="0" max="30" onchange="applyMotionConfig()" />
       <label>Hold Kp</label><input id="head_hold_kp" type="number" value="0.65" step="0.05" onchange="applyMotionConfig()" />
+      <label>Hold Ki</label><input id="head_hold_ki" type="number" value="0.08" step="0.01" onchange="applyMotionConfig()" />
       <label>Hold Kd</label><input id="head_hold_kd" type="number" value="1.20" step="0.01" onchange="applyMotionConfig()" />
+      <label>In-Place Ki Scale</label><input id="head_yaw_ki_scale" type="number" value="0.50" step="0.05" min="0" max="1.5" onchange="applyMotionConfig()" />
+      <label>In-Place Ki Band (deg)</label><input id="head_yaw_ki_band" type="number" value="8.0" step="0.2" min="1" max="30" onchange="applyMotionConfig()" />
       <button class="main" onclick="applyMotionConfig()">Apply Motion Config</button>
       <button onclick="imuZero()">Zero Yaw</button>
       <button onclick="imuCal()">Calibrate IMU Bias</button>
@@ -1329,6 +1400,7 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
     <div class="row" style="margin-top:8px">
       <label>Seq Distance (cm)</label><input id="pose_distcm" type="number" value="30" step="1" />
       <label>Seq Heading (deg)</label><input id="pose_yaw" type="number" value="0" step="1" min="-180" max="180" />
+      <label>Turn Overshoot (deg)</label><input id="pose_tbias" type="number" value="4.5" step="0.2" min="0" max="20" />
       <button class="start" onclick="startPoseMove()">TURN THEN MOVE</button>
       <div class="small">Sequence behavior: rotate in place to target heading, then move forward while continuously holding that heading with IMU correction.</div>
     </div>
@@ -1809,16 +1881,21 @@ async function applyMotionConfig(){
   const pkd=document.getElementById('pos_kd').value;
   const hyaw=document.getElementById('head_target').value;
   const hkp=document.getElementById('head_kp').value;
+  const hki=document.getElementById('head_ki').value;
   const hkd=document.getElementById('head_kd').value;
   const hmax=document.getElementById('head_max').value;
   const hhold=document.getElementById('head_hold').value;
   const hholdmax=document.getElementById('head_hold_max').value;
   const hholddb=document.getElementById('head_hold_db').value;
   const hhkp=document.getElementById('head_hold_kp').value;
+  const hhki=document.getElementById('head_hold_ki').value;
   const hhkd=document.getElementById('head_hold_kd').value;
+  const yikiscale=document.getElementById('head_yaw_ki_scale').value;
+  const yikiband=document.getElementById('head_yaw_ki_band').value;
+  const tbias=document.getElementById('pose_tbias').value;
   const alpha=document.getElementById('alpha').value;
   try {
-    await hit(`/cmd/motionConfig?stepcm=${stepcm}&wdcm=${wdcm}&postol=${postol}&pkp=${pkp}&pki=${pki}&pkd=${pkd}&hyaw=${hyaw}&hkp=${hkp}&hkd=${hkd}&hmax=${hmax}&hhold=${hhold}&hholdmax=${hholdmax}&hholddb=${hholddb}&hhkp=${hhkp}&hhkd=${hhkd}&alpha=${alpha}`);
+    await hit(`/cmd/motionConfig?stepcm=${stepcm}&wdcm=${wdcm}&postol=${postol}&pkp=${pkp}&pki=${pki}&pkd=${pkd}&hyaw=${hyaw}&hkp=${hkp}&hki=${hki}&hkd=${hkd}&hmax=${hmax}&hhold=${hhold}&hholdmax=${hholdmax}&hholddb=${hholddb}&hhkp=${hhkp}&hhki=${hhki}&hhkd=${hhkd}&yikiscale=${yikiscale}&yikiband=${yikiband}&tbias=${tbias}&alpha=${alpha}`);
     await refresh();
   } finally {
     motionCfgPending = false;
@@ -1827,8 +1904,9 @@ async function applyMotionConfig(){
 }
 async function startYawHold(){
   const hyaw=document.getElementById('head_target').value;
+  const tbias=document.getElementById('pose_tbias').value;
   await applyMotionConfig();
-  await hit(`/cmd/yawHoldStart?hyaw=${hyaw}`);
+  await hit(`/cmd/yawHoldStart?hyaw=${hyaw}&tbias=${tbias}`);
   await refresh();
 }
 async function startPosStep(dir){
@@ -1842,10 +1920,11 @@ async function startPosStep(dir){
 async function startPoseMove(){
   const distcm=document.getElementById('pose_distcm').value;
   const hyaw=document.getElementById('pose_yaw').value;
+  const tbias=document.getElementById('pose_tbias').value;
   const wdcm=document.getElementById('wheel_diam_cm').value;
   await applyMotionConfig();
   clearPositionGraph();
-  await hit(`/cmd/poseMove?distcm=${distcm}&hyaw=${hyaw}&wdcm=${wdcm}`);
+  await hit(`/cmd/poseMove?distcm=${distcm}&hyaw=${hyaw}&wdcm=${wdcm}&tbias=${tbias}`);
   await refresh();
 }
 async function applyRpmSign(){
@@ -1905,7 +1984,7 @@ async function refresh(){
   document.getElementById('status').textContent = `Status: ${d.enabled ? 'RUNNING' : 'STOPPED'} | Mode=${d.modeName} | Active wheel=${d.activeWheel} | Target=${f(d.pidTarget,1)} rpm (0..60) | Kp=${f(d.kp,2)} Ki=${f(d.ki,2)} Kd=${f(d.kd,2)} MinPWM=${d.minPwm} | LPF alpha=${f(d.rpmFilterAlpha,2)} | Sign BR/FR/BL/FL=${d.rpmSign[0]}/${d.rpmSign[1]}/${d.rpmSign[2]}/${d.rpmSign[3]}`;
   document.getElementById('rawStatus').textContent = `Raw mode: ${d.raw.enabled ? 'ACTIVE' : 'IDLE'} | PWM=${d.raw.pwm}`;
   const seqAgeMs = d.position.poseMovePhaseStartMs > 0 ? (d.nowMs - d.position.poseMovePhaseStartMs) : 0;
-  document.getElementById('motionStatus').textContent = `Position: target=${f(d.position.targetCm,2)} cm (${f(d.position.targetCounts,0)} cnt) | current=${f(d.position.currentCm,2)} cm (${f(d.position.currentCounts,0)} cnt) | error=${f(d.position.errorCm,2)} cm (${f(d.position.errorCounts,0)} cnt) | tol=${f(d.position.tolCm,2)} cm | cmd=${f(d.position.cmdRpm,2)} rpm | done=${d.position.done ? 'YES' : 'NO'} | Seq active=${d.position.poseMoveActive ? 1 : 0} phase=${f(d.position.poseMovePhase,0)} dist=${f(d.position.poseMoveDistanceCm,2)}cm age=${f(seqAgeMs,0)}ms tmo=${f(d.position.poseMoveTurnTimeoutMs,0)}ms res=${f(d.position.poseMoveLastResult,0)} | MoveHeadPID=(${f(d.heading.kp,2)}, ${f(d.heading.ki,2)}, ${f(d.heading.kd,2)}) | HoldHeadPID=(${f(d.heading.holdKp,2)}, ${f(d.heading.holdKi,2)}, ${f(d.heading.holdKd,2)}) | Hold=${d.heading.holdAtStop ? 'ON' : 'OFF'} active=${d.heading.holdActive ? '1' : '0'} stable=${f(d.heading.holdStableMs,0)}ms | hold min/max=${f(d.heading.holdMinRpm,1)}/${f(d.heading.holdMaxRpm,1)} db=${f(d.heading.holdDeadbandDeg,1)}deg`;
+  document.getElementById('motionStatus').textContent = `Position: target=${f(d.position.targetCm,2)} cm (${f(d.position.targetCounts,0)} cnt) | current=${f(d.position.currentCm,2)} cm (${f(d.position.currentCounts,0)} cnt) | error=${f(d.position.errorCm,2)} cm (${f(d.position.errorCounts,0)} cnt) | tol=${f(d.position.tolCm,2)} cm | cmd=${f(d.position.cmdRpm,2)} rpm | done=${d.position.done ? 'YES' : 'NO'} | Seq active=${d.position.poseMoveActive ? 1 : 0} phase=${f(d.position.poseMovePhase,0)} dist=${f(d.position.poseMoveDistanceCm,2)}cm age=${f(seqAgeMs,0)}ms tmo=${f(d.position.poseMoveTurnTimeoutMs,0)}ms res=${f(d.position.poseMoveLastResult,0)} | reqYaw=${f(d.position.poseMoveRequestedYawDeg,2)} tgtYaw=${f(d.heading.targetDeg,2)} bias=${f(d.position.poseMoveAppliedBiasDeg,2)} (cfg ${f(d.heading.turnOvershootDeg,2)}) | MoveHeadPID=(${f(d.heading.kp,2)}, ${f(d.heading.ki,2)}, ${f(d.heading.kd,2)}) | HoldHeadPID=(${f(d.heading.holdKp,2)}, ${f(d.heading.holdKi,2)}, ${f(d.heading.holdKd,2)}) | Hold=${d.heading.holdAtStop ? 'ON' : 'OFF'} active=${d.heading.holdActive ? '1' : '0'} stable=${f(d.heading.holdStableMs,0)}ms | hold min/max=${f(d.heading.holdMinRpm,1)}/${f(d.heading.holdMaxRpm,1)} db=${f(d.heading.holdDeadbandDeg,1)}deg`;
   document.getElementById('imuStatus').textContent = `IMU: ${d.imu.ok ? 'OK' : 'NOT FOUND'} | yaw=${f(d.imu.yawDeg,2)} deg | gyroZ=${f(d.imu.gyroDps,2)} dps | accX=${f(d.imu.accXg,3)}g | accY=${f(d.imu.accYg,3)}g | accXY=${f(d.imu.accXYg,3)}g | bias=${f(d.imu.biasDps,3)} dps | headingErr=${f(d.heading.errorDeg,2)} deg | corr=${f(d.heading.corrRpm,2)} rpm`;
   document.getElementById('debugStatus').textContent = `Debug: serial=${d.debug.serialEnabled ? 'ON' : 'OFF'}@${f(d.debug.serialPeriodMs,0)}ms | phase=${f(d.debug.yawPhase,0)} lock=${d.heading.yawHoldInPlaceMode ? 1 : 0} | rawErr=${f(d.debug.rawHeadingErrDeg,2)} usedErr=${f(d.debug.usedHeadingErrDeg,2)} | corrTarget=${f(d.debug.corrTargetRpm,2)} corrOut=${f(d.debug.corrAfterSlewRpm,2)} | gyroFilt=${f(d.debug.gyroDpsFilt,2)} | settled E/R=${d.debug.errSettled ? 1 : 0}/${d.debug.rateSettled ? 1 : 0}`;
   document.getElementById('slipStatus').textContent = `Slip: ${d.slip.enabled ? 'ENABLED' : 'DISABLED'} | state=${d.slip.detected ? 'DETECTED' : 'clear'} | candidate=${f(d.slip.candidateMs,0)}ms | avgWheel=${f(d.slip.avgWheelRpm,2)} rpm | rpmThr=${f(d.slip.wheelRpmThresh,1)} | accThr=${f(d.slip.accelThreshG,3)}g | detect=${f(d.slip.detectMs,0)}ms | release=${f(d.slip.releaseMs,0)}ms | maxRPM=${f(d.slip.maxRpm,1)}`;
@@ -1943,9 +2022,12 @@ async function refresh(){
   if (!freezeMotionSync) syncFieldValue('head_hold_kp', f(d.heading.holdKp,2));
   if (!freezeMotionSync) syncFieldValue('head_hold_ki', f(d.heading.holdKi,2));
   if (!freezeMotionSync) syncFieldValue('head_hold_kd', f(d.heading.holdKd,2));
+  if (!freezeMotionSync) syncFieldValue('head_yaw_ki_scale', f(d.heading.yawHoldInPlaceKiScale,2));
+  if (!freezeMotionSync) syncFieldValue('head_yaw_ki_band', f(d.heading.yawHoldInPlaceKiErrDeg,1));
   if (!freezeMotionSync) syncFieldValue('head_hold_rate_db', f(d.heading.holdExitRateDps,2));
   if (!freezeMotionSync) syncFieldValue('head_slew', f(d.heading.corrSlewRpmPerSec,1));
-  if (!freezeMotionSync && d.position.poseMoveActive) syncFieldValue('pose_yaw', f(d.heading.targetDeg,1));
+  if (!freezeMotionSync) syncFieldValue('pose_tbias', f(d.heading.turnOvershootDeg,2));
+  if (!freezeMotionSync && d.position.poseMoveActive) syncFieldValue('pose_yaw', f(d.position.poseMoveRequestedYawDeg,1));
   if (!freezeMotionSync && d.position.poseMoveActive) syncFieldValue('pose_distcm', f(d.position.poseMoveDistanceCm,2));
   syncFieldValue('dbg_en', d.debug.serialEnabled ? '1' : '0');
   syncFieldValue('dbg_ms', f(d.debug.serialPeriodMs,0));
@@ -2048,6 +2130,8 @@ String jsonData() {
   s += "\"poseMovePhaseStartMs\":" + String(poseMovePhaseStartMs) + ",";
   s += "\"poseMoveTurnTimeoutMs\":" + String(poseMoveTurnTimeoutMs) + ",";
   s += "\"poseMoveLastResult\":" + String(poseMoveLastResult) + ",";
+  s += "\"poseMoveRequestedYawDeg\":" + String(poseMoveRequestedYawDeg, 3) + ",";
+  s += "\"poseMoveAppliedBiasDeg\":" + String(poseMoveAppliedBiasDeg, 3) + ",";
   s += "\"tolCounts\":" + String(cmToCounts(positionTolCm), 3) + ",";
   s += "\"tolCm\":" + String(positionTolCm, 3) + ",";
   s += "\"cmdRpm\":" + String(positionCmdRpm, 3) + ",";
@@ -2083,7 +2167,10 @@ String jsonData() {
   s += "\"kd\":" + String(headingPid.kd, 5) + ",";
   s += "\"holdKp\":" + String(headingHoldPid.kp, 5) + ",";
   s += "\"holdKi\":" + String(headingHoldPid.ki, 5) + ",";
-  s += "\"holdKd\":" + String(headingHoldPid.kd, 5);
+  s += "\"holdKd\":" + String(headingHoldPid.kd, 5) + ",";
+  s += "\"yawHoldInPlaceKiScale\":" + String(yawHoldInPlaceKiScale, 5) + ",";
+  s += "\"yawHoldInPlaceKiErrDeg\":" + String(yawHoldInPlaceKiErrDeg, 5) + ",";
+  s += "\"turnOvershootDeg\":" + String(turnOvershootDeg, 5);
   s += "},";
 
   s += "\"debug\":{";
@@ -2319,6 +2406,15 @@ void handleMotionConfig() {
   if (server.hasArg("hhkp")) headingHoldPid.kp = server.arg("hhkp").toFloat();
   if (server.hasArg("hhki")) headingHoldPid.ki = server.arg("hhki").toFloat();
   if (server.hasArg("hhkd")) headingHoldPid.kd = server.arg("hhkd").toFloat();
+  if (server.hasArg("yikiscale")) {
+    yawHoldInPlaceKiScale = constrain(server.arg("yikiscale").toFloat(), 0.0f, 1.5f);
+  }
+  if (server.hasArg("yikiband")) {
+    yawHoldInPlaceKiErrDeg = constrain(server.arg("yikiband").toFloat(), 1.0f, 30.0f);
+  }
+  if (server.hasArg("tbias")) {
+    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
+  }
   if (server.hasArg("hmax")) {
     headingCorrMaxRpm = server.arg("hmax").toFloat();
     headingCorrMaxRpm = constrain(headingCorrMaxRpm, 0.0f, TARGET_RPM_MAX);
@@ -2385,6 +2481,14 @@ void handleYawHoldStart() {
   if (server.hasArg("hyaw")) {
     headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
   }
+  if (server.hasArg("tbias")) {
+    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
+  }
+
+  if (imuOk) {
+    float appliedBias = 0.0f;
+    headingTargetDeg = applyTurnOvershootComp(headingTargetDeg, imuYawDeg, turnOvershootDeg, &appliedBias);
+  }
 
   if (!imuOk) {
     controllerEnabled = false;
@@ -2406,7 +2510,8 @@ void handleYawHoldStart() {
   positionDone = true;
   positionDoneTicks = 5;
 
-  String msg = "Yaw hold active | targetDeg=" + String(headingTargetDeg, 2);
+  String msg = "Yaw hold active | targetDeg=" + String(headingTargetDeg, 2) +
+               " | turnBiasDeg=" + String(turnOvershootDeg, 2);
   server.send(200, "text/plain", msg);
 }
 
@@ -2468,8 +2573,18 @@ void handlePoseMove() {
   float distCm = server.hasArg("distcm") ? server.arg("distcm").toFloat() : positionStepCm;
   distCm = constrain(distCm, -1000.0f, 1000.0f);
 
+  if (server.hasArg("tbias")) {
+    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
+  }
+
   if (server.hasArg("hyaw")) {
     headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
+  }
+
+  poseMoveRequestedYawDeg = headingTargetDeg;
+  poseMoveAppliedBiasDeg = 0.0f;
+  if (imuOk) {
+    headingTargetDeg = applyTurnOvershootComp(poseMoveRequestedYawDeg, imuYawDeg, turnOvershootDeg, &poseMoveAppliedBiasDeg);
   }
 
   float startHeadingErrDeg = fabs(shortestAngleErrorDeg(headingTargetDeg, imuYawDeg));
@@ -2506,13 +2621,16 @@ void handlePoseMove() {
   poseMoveActive = true;
   poseMovePhase = 1;
   poseMovePhaseStartMs = millis();
+  poseMoveTurnOnly = fabsf(poseMoveDistanceCm) <= 0.5f;
   yawHoldInPlaceMode = true;
   positionTargetCounts = poseMoveStartCounts;
   positionDone = true;
   positionDoneTicks = 5;
 
   String msg = "Pose move started | distCm=" + String(poseMoveDistanceCm, 2) +
+               " | reqYawDeg=" + String(poseMoveRequestedYawDeg, 2) +
                " | targetYawDeg=" + String(headingTargetDeg, 2) +
+               " | appliedBiasDeg=" + String(poseMoveAppliedBiasDeg, 2) +
                " | startErrDeg=" + String(startHeadingErrDeg, 2) +
                " | turnTimeoutMs=" + String(poseMoveTurnTimeoutMs);
   server.send(200, "text/plain", msg);
