@@ -65,22 +65,22 @@ struct MinPwmSweepState {
 };
 
 EncoderPins encoders[4] = {
-    {39, 36, "ENC1 BackLeft"},
-    {34, 35, "ENC2 FrontLeft"},
-    {33, 32, "ENC3 FrontRight"},
+    {36, 39, "ENC1 BackLeft"},
+    {35, 34, "ENC2 FrontRight"},
+    {33, 32, "ENC3 FrontLeft"},
     {25, 26, "ENC4 BackRight"},
 };
 
 // Motor mapping validated in your testing:
 // MOTA -> Back Right -> GPIO27, GPIO14 -> ENC4
-// MOTB -> Front Right -> GPIO13, GPIO19 -> ENC3
-// MOTC -> Back Left  -> GPIO4, GPIO16  -> ENC1
-// MOTD -> Front Left -> GPIO17, GPIO18 -> ENC2
+// MOTB -> Front Right -> GPIO13, GPIO19 -> ENC2
+// MOTC -> Front Left -> GPIO4, GPIO16  -> ENC3
+// MOTD -> Back Left  -> GPIO17, GPIO18 -> ENC1
 MotorPins motors[4] = {
-    {27, 14, "MOTA BackRight", 3, 0, 1},
-    {13, 19, "MOTB FrontRight", 2, 2, 3},
-    {4, 16,  "MOTC BackLeft",   0, 4, 5},
-    {17, 18, "MOTD FrontLeft",  1, 6, 7},
+    {14, 27, "MOTA BackRight", 3, 0, 1},
+    {19, 13, "MOTB FrontRight", 1, 2, 3},
+    {18, 17, "MOTD BackLeft",   0, 6, 7},
+    {4, 16,  "MOTC FrontLeft",  2, 4, 5},
 };
 
 volatile int32_t encoderCount[4] = {0, 0, 0, 0};
@@ -91,7 +91,7 @@ float measuredRpmRaw[4] = {0, 0, 0, 0};
 float measuredRpm[4] = {0, 0, 0, 0};
 float targetRpm[4] = {0, 0, 0, 0};
 int16_t pwmCmd[4] = {0, 0, 0, 0};
-int8_t rpmSign[4] = {1, 1, -1, -1};
+int8_t rpmSign[4] = {-1, -1, -1, -1};
 
 PIDState pid[4] = {
   {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
@@ -1130,7 +1130,7 @@ void updateHighLevelTargets(float dt) {
     }
   }
 
-  // Right wheels: MOTA, MOTB. Left wheels: MOTC, MOTD.
+  // Right wheels: MOTA, MOTB. Left wheels: MOTD, MOTC.
   targetRpm[0] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
   targetRpm[1] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
   targetRpm[2] = constrain(positionCmdRpm + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
@@ -1577,9 +1577,9 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
       <label>Wheel</label>
       <select id="wheel">
         <option value="0">MOTA BackRight (ENC4)</option>
-        <option value="1">MOTB FrontRight (ENC3)</option>
-        <option value="2">MOTC BackLeft (ENC1)</option>
-        <option value="3">MOTD FrontLeft (ENC2)</option>
+        <option value="1">MOTB FrontRight (ENC2)</option>
+        <option value="2">MOTD BackLeft (ENC1)</option>
+        <option value="3">MOTC FrontLeft (ENC3)</option>
       </select>
 
       <label>Target RPM</label><input id="target" type="number" value="50" step="1" min="0" max="60" />
@@ -1597,13 +1597,13 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
     </div>
     <div class="row" style="margin-top:8px">
       <label>RPM Sign BR</label>
-      <select id="rs0" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <select id="rs0" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
       <label>FR</label>
-      <select id="rs1" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <select id="rs1" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
       <label>BL</label>
-      <select id="rs2" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <select id="rs2" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
       <label>FL</label>
-      <select id="rs3" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1">-1</option></select>
+      <select id="rs3" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
       <button class="main" onclick="applyRpmSign()">Apply RPM Sign</button>
     </div>
     <div class="small" id="status">Status: -</div>
@@ -1748,8 +1748,8 @@ button.stop{background:#b91c1c;border-color:#b91c1c}
       <tbody>
         <tr><td>MOTA BackRight</td><td id="tr0">0</td><td id="mr0">0</td><td id="er0">0</td><td id="pw0">0</td></tr>
         <tr><td>MOTB FrontRight</td><td id="tr1">0</td><td id="mr1">0</td><td id="er1">0</td><td id="pw1">0</td></tr>
-        <tr><td>MOTC BackLeft</td><td id="tr2">0</td><td id="mr2">0</td><td id="er2">0</td><td id="pw2">0</td></tr>
-        <tr><td>MOTD FrontLeft</td><td id="tr3">0</td><td id="mr3">0</td><td id="er3">0</td><td id="pw3">0</td></tr>
+        <tr><td>MOTD BackLeft</td><td id="tr2">0</td><td id="mr2">0</td><td id="er2">0</td><td id="pw2">0</td></tr>
+        <tr><td>MOTC FrontLeft</td><td id="tr3">0</td><td id="mr3">0</td><td id="er3">0</td><td id="pw3">0</td></tr>
       </tbody>
     </table>
   </div>
@@ -2518,7 +2518,7 @@ String jsonData() {
   }
   s += "],";
 
-  // measuredRpm[] is already in motor order [MOTA, MOTB, MOTC, MOTD]
+  // measuredRpm[] is already in logical wheel order [MOTA BR, MOTB FR, MOTD BL, MOTC FL]
   s += "\"measured\":[";
   for (uint8_t i = 0; i < 4; i++) {
     s += String(measuredRpm[i], 3);
